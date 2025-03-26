@@ -1,0 +1,1 @@
+docker run -tid --restart unless-stopped --name dbpedia-spotlight.en --mount source=spotlight-model,target=/opt/spotlight --mount type=bind,source=./models,target=/opt/spotlight/models -p 2222:80 --platform linux/amd64 dbpedia/dbpedia-spotlight spotlight.sh en
