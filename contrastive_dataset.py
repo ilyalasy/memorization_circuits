@@ -151,51 +151,63 @@ def find_minimum_context_for_memorization(model: AutoModelForCausalLM,
     sequences['diverging_position'] = min_context_len.tolist()
     return sequences
 
-def to_autocircuit_ds(calculated_sequences:dict[str,t.Tensor],return_seq_length: bool = False,tail_divergence: bool = False, test_size: float = 0.1, batch_size: int | tuple[int, int] = 8):
+def save_jsonl(all_sequences:dict,path:Path,tokenizer:AutoTokenizer):
+    total_skipped_count = 0
+    print(f"Saving decoded data to {path}")        
+    with open(path, 'w') as f:
+        for i in range(len(all_sequences['minimal_context'])):
+            # Filter those that cannot create clean/corrupt pair
+            if all_sequences['next_gt_tokens'][i][0] == all_sequences['next_generated_tokens'][i][0]:
+                total_skipped_count += 1
+                continue
+            sample = {                    
+                'minimal_context': tokenizer.decode(all_sequences['minimal_context'][i]),
+                'next_gt_tokens': tokenizer.batch_decode(all_sequences['next_gt_tokens'][i]),
+                'next_generated_tokens': tokenizer.batch_decode(all_sequences['next_generated_tokens'][i]),
 
-    dataset = PromptDataset(clean_prompts=calculated_sequences["minimal_context_gt"].to(device), 
-                            corrupt_prompts=calculated_sequences["minimal_context_generated"].to(device),
-                            answers=[calculated_sequences["next_gt_token"].unsqueeze(0).to(device)],
-                            wrong_answers=[calculated_sequences["next_generated_token"].unsqueeze(0).to(device)])
-     
-    dataset_size = len(dataset)
-    train_size = int(dataset_size * (1 - test_size))
-    train_set = Subset(dataset, list(range(train_size)))
-    test_set = Subset(dataset, list(range(train_size, dataset_size)))
+                'diverging_position': all_sequences['diverging_position'][i],
+                'score_before': all_sequences['score_before'][i],
+                'score_after': all_sequences['score_after'][i]
+            }
+            
+            # Write as JSON line
+            f.write(json.dumps(sample) + '\n')
+    print(f"Total skipped count: {total_skipped_count}/{len(mem_df)}")
 
-    seq_len = None    
-    diverge_idx: int = 0
-    kvs = []
-    if return_seq_length:        
-        seq_len = df["context"].shape[1]
+def save_autocircuit_ds(all_sequences:dict, path:Path, tokenizer:AutoTokenizer):
+    """
+    Save the dataset in a format compatible with AutoCircuit.
     
-    if tail_divergence:
-        diverge_idxs = (~(df["context"] == df["context"])).int().argmax(dim=1)
-        diverge_idx = int(diverge_idxs.min().item())
-    if diverge_idx > 0:
-        raise NotImplementedError()
+    Args:
+        all_sequences: Dictionary containing the sequences data
+        path: Path where to save the dataset
+        tokenizer: Tokenizer to use for encoding if needed
+    """
+    autocircuit_data = {
+        "prompts": []
+    }
+    
+    for i in range(len(all_sequences['minimal_context'])):
+        # Skip pairs where clean and corrupt are identical
+        if all_sequences['next_gt_tokens'][i][0] == all_sequences['next_generated_tokens'][i][0]:
+            continue
+            
+        # Create a prompt pair
+        prompt_pair = {
+            "clean": tokenizer.decode(all_sequences['minimal_context'][i] + all_sequences['next_gt_tokens'][i][0]),
+            "corrupt": tokenizer.decode(all_sequences['minimal_context'][i] + all_sequences['next_generated_tokens'][i][0]),
+            "answers": [tokenizer.decode(all_sequences['next_gt_tokens'][i][1])],
+            "wrong_answers": [tokenizer.decode(all_sequences['next_generated_tokens'][i][1])]
+        }
+        
+        autocircuit_data["prompts"].append(prompt_pair)
+    
+    # Save the dataset
+    with open(path, 'w') as f:
+        json.dump(autocircuit_data, f, indent=2)
+    
+    print(f"Saved AutoCircuit dataset with {len(autocircuit_data['prompts'])} prompt pairs to {path}")
 
-    train_loader = PromptDataLoader(
-        train_set,
-        seq_len=seq_len,
-        diverge_idx=diverge_idx,
-        kv_cache=kvs[0] if len(kvs) > 0 else None,
-        seq_labels=None,
-        word_idxs=None,
-        batch_size=batch_size[0] if isinstance(batch_size, tuple) else batch_size,
-        shuffle=False,
-    )
-    test_loader = PromptDataLoader(
-        test_set,
-        seq_len=seq_len,
-        diverge_idx=diverge_idx,
-        kv_cache=kvs[-1] if len(kvs) > 0 else None,
-        seq_labels=None,
-        word_idxs=None,
-        batch_size=batch_size[1] if isinstance(batch_size, tuple) else batch_size,
-        shuffle=False,
-    )
-    return train_loader, test_loader
 
 if __name__ == "__main__":    
     parser = argparse.ArgumentParser(description="Generate contrastive dataset")
@@ -236,28 +248,5 @@ if __name__ == "__main__":
             for key in sequences:
                 all_sequences[key].extend(sequences[key])
         
-        total_skipped_count = 0
-        print(f"Saving decoded data to {path}")        
-        with open(path, 'w') as f:
-            for i in range(len(all_sequences['minimal_context'])):
-                # Filter those that cannot create clean/corrupt pair
-                if all_sequences['next_gt_tokens'][i][0] == all_sequences['next_generated_tokens'][i][0]:
-                    total_skipped_count += 1
-                    continue
-                sample = {                    
-                    'minimal_context': tokenizer.decode(all_sequences['minimal_context'][i]),
-                    'next_gt_tokens': tokenizer.batch_decode(all_sequences['next_gt_tokens'][i]),
-                    'next_generated_tokens': tokenizer.batch_decode(all_sequences['next_generated_tokens'][i]),
-
-                    'diverging_position': all_sequences['diverging_position'][i],
-                    'score_before': all_sequences['score_before'][i],
-                    'score_after': all_sequences['score_after'][i]
-                }
-                
-                # Write as JSON line
-                f.write(json.dumps(sample) + '\n')
-        print(f"Total skipped count: {total_skipped_count}/{len(mem_df)}")
-
-    # train_loader, test_loader = to_autocircuit_ds(all_sequences,return_seq_length=True,tail_divergence=True,test_size=0.1,batch_size=batch_size)
-
-
+        save_jsonl(all_sequences,path,tokenizer)
+        save_autocircuit_ds(all_sequences,path.with_suffix("_ac.json"),tokenizer)
