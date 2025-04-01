@@ -25,73 +25,29 @@ device = t.device("cuda" if t.cuda.is_available() else "mps")
 def convert_to_sequences(context_tensor:t.Tensor,
                          generated_outputs:dict[int,t.Tensor],
                          min_context_len:t.Tensor,
-                         whole_samples:t.Tensor,
-                         tokenizer:AutoTokenizer):
+                         whole_samples:t.Tensor):
     
     # Create the requested sequences for each sample using stored data
-    minimal_context_gt = []
-    minimal_context_generated = []
-    next_gt_token = []
-    next_generated_token = []
+    minimal_context = []    
+    next_gt_tokens = []
+    next_generated_tokens = []
     
-    skipped_ids = []
     for i in range(len(batch)):
         min_len = int(min_context_len[i].item())
         
         # Get the context up to min_len
         min_context = context_tensor[i, :min_len]
+        minimal_context.append(min_context)
 
-        next_gt_from_completion = whole_samples[i, min_len]
-
-        gen_output = generated_outputs[min_len][i]
-        next_gen_token = gen_output[min_len]
-
-        # Skip this sample if the next generated token is the same as the ground truth token
-        if next_gen_token.item() == next_gt_from_completion.item():
-            skipped_ids.append(i)
-            continue
-        
-        # 1. Sequence of minimal context + ground truth token
-        # Get next ground truth token after min_context        
-        context_plus_gt = t.cat([min_context, next_gt_from_completion.unsqueeze(0)], dim=0)        
-        minimal_context_gt.append(context_plus_gt)
-        
-        # 2. Sequence of minimal context + argmax token
-        # Get the generation output for this context length
-        
-        context_plus_generated = t.cat([min_context, next_gen_token.unsqueeze(0)], dim=0)
-        minimal_context_generated.append(context_plus_generated)
-        
-        # 3. Next ground truth token (after sequence 1)
-        next_gt = whole_samples[i, min_len + 1].unsqueeze(0) if min_len + 1 < whole_samples.size(1) else t.tensor([tokenizer.eos_token_id]).to(device)
-        next_gt_token.append(next_gt)
-        
-        # 4. Next argmax token (after sequence 2)
-        next_gen = gen_output[min_len + 1].unsqueeze(0) if min_len + 1 < len(gen_output) else t.tensor([tokenizer.eos_token_id]).to(device)
-        next_generated_token.append(next_gen)
-
-
-        # Print decoded versions of all 4 sequences for inspection
-        # print("Minimal Context + GT Token:")
-        # print(tokenizer.decode(context_plus_gt))
-        
-        # print("\nNext GT Token:")
-        # print(tokenizer.decode(next_gt))
-        
-        # print("\nMinimal Context + Generated Token:")
-        # print(tokenizer.decode(context_plus_generated))
-        
-        # print("\nNext Generated Token:")
-        # print(tokenizer.decode(next_gen))
-    # if len(skipped_ids) > 0:
-    #     print("Following samples were skipped as they had the same next token: ", skipped_ids)
+        # take the next 2 tokens: first one will serve as clean/corrupted prompt, second one will be the correct/wrong answer
+        next_gt_tokens.append(whole_samples[i, min_len:min_len+2].tolist())
+        next_generated_tokens.append(generated_outputs[min_len][i, min_len:min_len+2].tolist()) 
     
     return {
-        'minimal_context_gt': t.tensor(minimal_context_gt),
-        'next_gt_token': t.tensor(next_gt_token),
-        'minimal_context_generated': t.tensor(minimal_context_generated),
-        'next_generated_token': t.tensor(next_generated_token)
-    }, len(skipped_ids)
+        'minimal_context': minimal_context,
+        'next_gt_tokens': next_gt_tokens,
+        'next_generated_tokens': next_generated_tokens        
+    }
 
 
 def find_minimum_context_for_memorization(model: AutoModelForCausalLM, 
@@ -110,6 +66,10 @@ def find_minimum_context_for_memorization(model: AutoModelForCausalLM,
     
     # Store the generated outputs at each context length
     generated_outputs = {}
+
+    # Store scores before and after the drop
+    scores_before = t.ones(len(batch))
+    scores_after = t.ones(len(batch))
     
     for current_len in tqdm(range(context_len, 0, -1),desc="Finding minimum context length for memorization",total=context_len):
         current_context = context_tensor[:, :current_len]
@@ -165,6 +125,11 @@ def find_minimum_context_for_memorization(model: AutoModelForCausalLM,
         # 2. We haven't found a min_context_len yet
         # 3. The generated token is different from ground truth token
         mask = (relative_drop > significant_drop_threshold) & t.isnan(min_context_len) & next_token_diff_mask
+        
+        # Store scores before and after the drop
+        scores_before[mask] = previous_scores[mask]
+        scores_after[mask] = benchmark_score[mask]
+
         min_context_len[mask] = current_len
 
         # Update previous score        
@@ -178,9 +143,13 @@ def find_minimum_context_for_memorization(model: AutoModelForCausalLM,
     # Ensure all samples have a valid min_context_len by using the full context if necessary
     min_context_len[t.isnan(min_context_len)] = context_len
     
-    sequences,skipped_count = convert_to_sequences(context_tensor,generated_outputs,min_context_len,whole_samples,tokenizer)
-    
-    return min_context_len, scores, sequences, skipped_count
+    sequences = convert_to_sequences(context_tensor,generated_outputs,min_context_len,whole_samples)
+
+    # Add scores to sequences
+    sequences['score_before'] = scores_before.tolist()
+    sequences['score_after'] = scores_after.tolist()
+    sequences['diverging_position'] = min_context_len.tolist()
+    return sequences
 
 def to_autocircuit_ds(calculated_sequences:dict[str,t.Tensor],return_seq_length: bool = False,tail_divergence: bool = False, test_size: float = 0.1, batch_size: int | tuple[int, int] = 8):
 
@@ -255,42 +224,40 @@ if __name__ == "__main__":
     # Instead of processing everything at once, let's chunk it
     batches = [mem_df.iloc[i:i+batch_size] for i in range(0, len(mem_df), batch_size)]
 
-    path = Path(f"data/results/contrastive_mem_{threshold}_{model_name.split('/')[-1]}_{metric}.pt")
+    path = Path(f"data/results/contrastive_mem_{threshold}_{model_name.split('/')[-1]}_{metric}.jsonl")
 
     if path.exists():
-        all_sequences = t.load(path,weights_only=False)
+        with open(path, 'r') as f:
+            all_sequences = [json.loads(line) for line in f]
     else:
         all_sequences = defaultdict(list)
-        total_skipped_count = 0
         for batch in tqdm(batches,desc="Processing batches"):
-            min_context_len,scores,sequences,skipped_count = find_minimum_context_for_memorization(model,batch,tokenizer,benchmark_metric=metric)
+            sequences = find_minimum_context_for_memorization(model,batch,tokenizer,benchmark_metric=metric)
             for key in sequences:
-                all_sequences[key].append(sequences[key])
-            total_skipped_count += skipped_count
-        print(f"Total skipped count: {total_skipped_count}/{len(mem_df)}")
+                all_sequences[key].extend(sequences[key])
         
-        
-        for key in all_sequences:
-            all_sequences[key] = t.cat(all_sequences[key])
-        t.save(dict(all_sequences), path)
-
-        # Save decoded keys as jsonl
-        jsonl_path = path.with_suffix(".jsonl")
-        
-        print(f"Saving decoded data to {jsonl_path}")        
-        with open(jsonl_path, 'w') as f:
-            for i in range(len(all_sequences['minimal_context_gt'])):
-                # Create a dictionary for each example
+        total_skipped_count = 0
+        print(f"Saving decoded data to {path}")        
+        with open(path, 'w') as f:
+            for i in range(len(all_sequences['minimal_context'])):
+                # Filter those that cannot create clean/corrupt pair
+                if all_sequences['next_gt_tokens'][i][0] == all_sequences['next_generated_tokens'][i][0]:
+                    total_skipped_count += 1
+                    continue
                 sample = {                    
-                    'minimal_context_gt': tokenizer.decode(all_sequences['minimal_context_gt'][i]),
-                    'next_gt_token': tokenizer.decode(all_sequences['next_gt_token'][i]),
-                    'minimal_context_generated': tokenizer.decode(all_sequences['minimal_context_generated'][i]),
-                    'next_generated_token': tokenizer.decode(all_sequences['next_generated_token'][i])
+                    'minimal_context': tokenizer.decode(all_sequences['minimal_context'][i]),
+                    'next_gt_tokens': tokenizer.batch_decode(all_sequences['next_gt_tokens'][i]),
+                    'next_generated_tokens': tokenizer.batch_decode(all_sequences['next_generated_tokens'][i]),
+
+                    'diverging_position': all_sequences['diverging_position'][i],
+                    'score_before': all_sequences['score_before'][i],
+                    'score_after': all_sequences['score_after'][i]
                 }
                 
                 # Write as JSON line
-                f.write(json.dumps(sample) + '\n')        
+                f.write(json.dumps(sample) + '\n')
+        print(f"Total skipped count: {total_skipped_count}/{len(mem_df)}")
 
-    train_loader, test_loader = to_autocircuit_ds(all_sequences,return_seq_length=True,tail_divergence=True,test_size=0.1,batch_size=batch_size)
+    # train_loader, test_loader = to_autocircuit_ds(all_sequences,return_seq_length=True,tail_divergence=True,test_size=0.1,batch_size=batch_size)
 
 
