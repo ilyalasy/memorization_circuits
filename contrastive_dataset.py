@@ -5,7 +5,9 @@ from pathlib import Path
 from transformers import AutoTokenizer,AutoModelForCausalLM
 from tqdm.auto import tqdm
 import numpy as np
+from collections import defaultdict
 # from pandarallel import pandarallel
+import json
 
 import evaluate
 from typing import Literal
@@ -81,15 +83,15 @@ def convert_to_sequences(context_tensor:t.Tensor,
         
         # print("\nNext Generated Token:")
         # print(tokenizer.decode(next_gen))
-    if len(skipped_ids) > 0:
-        print("Following samples were skipped as they had the same next token: ", skipped_ids)
+    # if len(skipped_ids) > 0:
+    #     print("Following samples were skipped as they had the same next token: ", skipped_ids)
     
     return {
-        'minimal_context_gt': minimal_context_gt,
-        'next_gt_token': next_gt_token,
-        'minimal_context_generated': minimal_context_generated,
-        'next_generated_token': next_generated_token
-    }
+        'minimal_context_gt': t.tensor(minimal_context_gt),
+        'next_gt_token': t.tensor(next_gt_token),
+        'minimal_context_generated': t.tensor(minimal_context_generated),
+        'next_generated_token': t.tensor(next_generated_token)
+    }, len(skipped_ids)
 
 
 def find_minimum_context_for_memorization(model: AutoModelForCausalLM, 
@@ -156,9 +158,14 @@ def find_minimum_context_for_memorization(model: AutoModelForCausalLM,
         
         relative_drop = (previous_scores - benchmark_score) / previous_scores
         
-        # Only update min_context_len for elements that are still NaN
-        mask = (relative_drop > significant_drop_threshold) & t.isnan(min_context_len)
-        min_context_len[mask] = current_len        
+        next_token_diff_mask = (generated_completion[:,0] != whole_samples[:, current_len]).cpu()
+
+        # Only update min_context_len if:
+        # 1. Relative drop is significant
+        # 2. We haven't found a min_context_len yet
+        # 3. The generated token is different from ground truth token
+        mask = (relative_drop > significant_drop_threshold) & t.isnan(min_context_len) & next_token_diff_mask
+        min_context_len[mask] = current_len
 
         # Update previous score        
         previous_scores = benchmark_score
@@ -171,9 +178,9 @@ def find_minimum_context_for_memorization(model: AutoModelForCausalLM,
     # Ensure all samples have a valid min_context_len by using the full context if necessary
     min_context_len[t.isnan(min_context_len)] = context_len
     
-    sequences = convert_to_sequences(context_tensor,generated_outputs,min_context_len,whole_samples,tokenizer)
+    sequences,skipped_count = convert_to_sequences(context_tensor,generated_outputs,min_context_len,whole_samples,tokenizer)
     
-    return min_context_len, scores, sequences
+    return min_context_len, scores, sequences, skipped_count
 
 def to_autocircuit_ds(calculated_sequences:dict[str,t.Tensor],return_seq_length: bool = False,tail_divergence: bool = False, test_size: float = 0.1, batch_size: int | tuple[int, int] = 8):
 
@@ -224,7 +231,7 @@ def to_autocircuit_ds(calculated_sequences:dict[str,t.Tensor],return_seq_length:
 if __name__ == "__main__":    
     parser = argparse.ArgumentParser(description="Generate contrastive dataset")
     parser.add_argument("--batch_size", type=int, default=8, help="Batch size for processing")
-    parser.add_argument("--threshold", type=float, default=0.8, help="Memorization score threshold")
+    parser.add_argument("--threshold", type=float, default=0.5, help="Memorization score threshold")
     parser.add_argument("--metric", type=str, default="bleu", choices=["memorization", "bleu"], help="Benchmark metric to use: 'memorization' for exact memorization or 'bleu' for approximate memorization")
     parser.add_argument("--model_name", type=str, default="EleutherAI/pythia-70m-deduped", help="Model to use")
     
@@ -237,26 +244,52 @@ if __name__ == "__main__":
 
     df = pd.read_json("data/results/memorization_scores_pythia-70m-deduped_32_32.json")
 
-    some_mem = df[df['memorization_score'] > threshold]
-    some_mem = some_mem.sort_values('memorization_score', ascending=False)
+    mem_df = df[df['memorization_score'] > threshold]
+    mem_df = mem_df.sort_values('memorization_score', ascending=False)
 
     tokenizer = AutoTokenizer.from_pretrained(model_name)
     model = AutoModelForCausalLM.from_pretrained(model_name).to(device)
 
+    if device.type == "cuda":
+        model = model.half()
     # Instead of processing everything at once, let's chunk it
-    batches = [df.iloc[i:i+batch_size] for i in range(0, len(df), batch_size)]
+    batches = [mem_df.iloc[i:i+batch_size] for i in range(0, len(mem_df), batch_size)]
 
     path = Path(f"data/results/contrastive_mem_{threshold}_{model_name.split('/')[-1]}_{metric}.pt")
 
     if path.exists():
-        all_sequences = t.load(path)
+        all_sequences = t.load(path,weights_only=False)
     else:
-        all_sequences = []
+        all_sequences = defaultdict(list)
+        total_skipped_count = 0
         for batch in tqdm(batches,desc="Processing batches"):
-            min_context_len,scores,sequences = find_minimum_context_for_memorization(model,batch,tokenizer,benchmark_metric=metric)
-            all_sequences.extend(sequences)
-        t.save(all_sequences, path)
+            min_context_len,scores,sequences,skipped_count = find_minimum_context_for_memorization(model,batch,tokenizer,benchmark_metric=metric)
+            for key in sequences:
+                all_sequences[key].append(sequences[key])
+            total_skipped_count += skipped_count
+        print(f"Total skipped count: {total_skipped_count}/{len(mem_df)}")
+        
+        
+        for key in all_sequences:
+            all_sequences[key] = t.cat(all_sequences[key])
+        t.save(dict(all_sequences), path)
 
+        # Save decoded keys as jsonl
+        jsonl_path = path.with_suffix(".jsonl")
+        
+        print(f"Saving decoded data to {jsonl_path}")        
+        with open(jsonl_path, 'w') as f:
+            for i in range(len(all_sequences['minimal_context_gt'])):
+                # Create a dictionary for each example
+                sample = {                    
+                    'minimal_context_gt': tokenizer.decode(all_sequences['minimal_context_gt'][i]),
+                    'next_gt_token': tokenizer.decode(all_sequences['next_gt_token'][i]),
+                    'minimal_context_generated': tokenizer.decode(all_sequences['minimal_context_generated'][i]),
+                    'next_generated_token': tokenizer.decode(all_sequences['next_generated_token'][i])
+                }
+                
+                # Write as JSON line
+                f.write(json.dumps(sample) + '\n')        
 
     train_loader, test_loader = to_autocircuit_ds(all_sequences,return_seq_length=True,tail_divergence=True,test_size=0.1,batch_size=batch_size)
 
