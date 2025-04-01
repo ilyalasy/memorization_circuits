@@ -1,3 +1,4 @@
+import argparse
 import torch
 from datasets import load_dataset, Dataset
 from transformers import AutoModelForCausalLM, AutoTokenizer
@@ -78,12 +79,30 @@ def calculate_memorization_score(model:AutoModelForCausalLM, tokenizer:AutoToken
     # Convert to DataFrame
     return pd.DataFrame(results)
 
-def main():
-    # Parameters
-    model_name = "EleutherAI/pythia-70m-deduped"  
-    prompt_tokens = 32
-    generation_tokens = 32
-    batch_size = 128  # Added batch size parameter
+def main():    
+    
+    # Set up argument parser
+    parser = argparse.ArgumentParser(description="Calculate memorization scores for language models")
+    parser.add_argument("--model_name", type=str, default="EleutherAI/pythia-410m-deduped", 
+                        help="Name of the model to use")
+    parser.add_argument("--prompt_tokens", type=int, default=32, 
+                        help="Number of tokens to use as prompt")
+    parser.add_argument("--generation_tokens", type=int, default=96, 
+                        help="Number of tokens to generate")
+    parser.add_argument("--batch_size", type=int, default=128, 
+                        help="Batch size for processing")
+    parser.add_argument("--dataset", type=str, default="timaeus/pile-wikipedia_en", 
+                        help="Dataset to use for evaluation")
+    parser.add_argument("--output_dir", type=str, default="data/results", 
+                        help="Directory to save results")
+    
+    args = parser.parse_args()
+    
+    # Parameters from arguments
+    model_name = args.model_name
+    prompt_tokens = args.prompt_tokens
+    generation_tokens = args.generation_tokens
+    batch_size = args.batch_size
     
     print(f"Loading model: {model_name}")
     model = AutoModelForCausalLM.from_pretrained(model_name, torch_dtype=torch.float16) # torch_dtype=torch.float16
@@ -91,12 +110,12 @@ def main():
     tokenizer.pad_token_id = tokenizer.eos_token_id
     tokenizer.padding_side = 'right'
     
-    print("Loading Wikipedia dataset")
-    dataset = load_dataset("timaeus/pile-wikipedia_en", split="train") #streaming=True
+    print(f"Loading dataset: {args.dataset}")
+    dataset = load_dataset(args.dataset, split="train") #streaming=True
     
     print(f"Calculating memorization score (prompt: {prompt_tokens} tokens, generate: {generation_tokens} tokens)")
     
-    path = Path(f"data/results/memorization_scores_{model_name.split('/')[-1]}_{prompt_tokens}_{generation_tokens}.json")
+    path = Path(f"{args.output_dir}/memorization_scores_{model_name.split('/')[-1]}_{prompt_tokens}_{generation_tokens}.json")
     if path.exists():
         results_df = pd.read_json(path, orient='records')
         print(f"Loaded existing results from {path}")
