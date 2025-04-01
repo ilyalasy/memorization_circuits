@@ -194,8 +194,8 @@ def save_autocircuit_ds(all_sequences:dict, path:Path, tokenizer:AutoTokenizer):
             
         # Create a prompt pair
         prompt_pair = {
-            "clean": tokenizer.decode(all_sequences['minimal_context'][i] + all_sequences['next_gt_tokens'][i][0]),
-            "corrupt": tokenizer.decode(all_sequences['minimal_context'][i] + all_sequences['next_generated_tokens'][i][0]),
+            "clean": tokenizer.decode(all_sequences['minimal_context'][i].tolist() + [all_sequences['next_gt_tokens'][i][0]]),
+            "corrupt": tokenizer.decode(all_sequences['minimal_context'][i].tolist() + [all_sequences['next_generated_tokens'][i][0]]),
             "answers": [tokenizer.decode(all_sequences['next_gt_tokens'][i][1])],
             "wrong_answers": [tokenizer.decode(all_sequences['next_generated_tokens'][i][1])]
         }
@@ -248,5 +248,5 @@ if __name__ == "__main__":
             for key in sequences:
                 all_sequences[key].extend(sequences[key])
         
+        save_autocircuit_ds(all_sequences,path.with_name(f"{path.stem}_ac.json"),tokenizer)
         save_jsonl(all_sequences,path,tokenizer)
-        save_autocircuit_ds(all_sequences,path.with_suffix("_ac.json"),tokenizer)
