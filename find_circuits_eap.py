@@ -1,5 +1,6 @@
 from functools import partial
-
+from typing import Callable
+import argparse
 import pandas as pd
 import torch
 from torch.utils.data import Dataset, DataLoader, random_split
@@ -115,64 +116,89 @@ def kl_div_(logits: torch.Tensor, clean_logits: torch.Tensor, input_length: torc
     results = kl_div(logits.log_softmax(dim=-1), clean_logits.softmax(dim=-1), reduction='none').mean(-1)
     return results.mean() if mean else results
 
+def find_minimal_circuit(model: HookedTransformer, g: Graph, test_dataloader: DataLoader,  metrics: list[Callable], target_performance_pct :float= 0.8) -> tuple[Graph,int]:
+    # Find minimal circuit that maintains 80% performance of baseline
+    # Evaluation is done on the test set
+    target_performance = target_performance_pct * baseline_logit_diff
+    best_n = len(g.edges)  # Start with a total number of edges
+    min_n = 1
+    max_n = best_n
+    step = 10
 
-MODEL_NAME = "EleutherAI/pythia-70m-deduped"
-path = Path(f"data/results/contrastive_mem_0.5_pythia-70m-deduped_bleu_ac.json")
+    # Binary search to find minimal circuit
+    while min_n <= max_n:
+        n = (min_n + max_n) // 2    
+        g.apply_topn(n, True)
+        # Evaluate on test data
+        results = evaluate_graph(model, g, test_dataloader, metrics,skip_clean=False)
+        if not isinstance(results, list):
+            results = [results]
+        results = [result.mean().item() for result in results]
+        
+        performance = results[0] # assume main metric (logit_diff) is the first metric
 
-model = HookedTransformer.from_pretrained(MODEL_NAME, device=device)
-model.cfg.use_split_qkv_input = True
-model.cfg.use_attn_result = True
-model.cfg.use_hook_mlp_in = True
+        if performance >= target_performance:
+            best_n = n
+            max_n = n - step  # Try smaller
+        else:
+            min_n = n + step  # Try larger
+        print(f"edges: {n}, Results: {results}")
 
-ds = EAPDataset(path, model.tokenizer) 
-# Create train and test dataloaders
-train_dataloader, test_dataloader = ds.to_dataloader(batch_size=32, test_size=0.1, seed=42) 
+    # Apply the minimal circuit size that maintains performance
+    g.apply_topn(best_n, True)
+    return g,best_n
 
 
-# Evaluate baseline on the test data
-baseline_logit_diff = evaluate_baseline(model, test_dataloader, partial(logit_diff, loss=False, mean=False)).mean().item()
-print(f"Baseline logit_diff: {baseline_logit_diff}")
-
-g = Graph.from_model(model)
-# Attribute using the training data
-attribute(model, g, train_dataloader, 
-          partial(logit_diff, loss=True, mean=True),
-          method='EAP-IG-activations',
-          ig_steps=5)
-
-# Find minimal circuit that maintains 80% performance of baseline
-# Evaluation is done on the test set
-target_performance = 0.8 * baseline_logit_diff
-best_n = len(g.edges)  # Start with a total number of edges
-min_n = 1
-max_n = best_n
-step = 10
-
-eval_metrics = [partial(logit_diff, loss=False, mean=False),partial(kl_div_, loss=False, mean=False)]
-# Binary search to find minimal circuit
-while min_n <= max_n:
-    n = (min_n + max_n) // 2    
-    g.apply_topn(n, True)
-    # Evaluate on test data
-    performance, kl_performance = evaluate_graph(model, g, test_dataloader, eval_metrics,skip_clean=False)
-    performance = performance.mean().item()
-    kl_performance = kl_performance.mean().item()
+if __name__ == "__main__":    
+    parser = argparse.ArgumentParser(description="Generate contrastive dataset")
+    parser.add_argument("--batch_size", type=int, default=32, help="Batch size for processing")
+    parser.add_argument("--threshold", type=float, default=0.5, help="Memorization score threshold")
+    parser.add_argument("--metric", type=str, default="bleu", choices=["memorization", "bleu"], help="Benchmark metric to use: 'memorization' for exact memorization or 'bleu' for approximate memorization")
+    parser.add_argument("--model_name", type=str, default="EleutherAI/pythia-70m-deduped", help="Model to use")
+    parser.add_argument("--prompt_tokens", type=int, default=32, help="Number of tokens to use as prompt")
+    parser.add_argument("--generation_tokens", type=int, default=96, help="Number of tokens to generate")
     
-    if performance >= target_performance:
-        best_n = n
-        max_n = n - step  # Try smaller
-    else:
-        min_n = n + step  # Try larger
-    print(f"edges: {n}, logit_diff: {performance:.2f}, kl_div: {kl_performance}")
+    args = parser.parse_args()
+    
+    batch_size = args.batch_size
+    threshold = args.threshold
+    metric = args.metric
+    model_name = args.model_name
+    prompt_tokens = args.prompt_tokens
+    generation_tokens = args.generation_tokens
 
-# Apply the minimal circuit size that maintains performance
-g.apply_topn(best_n, True)
-# Final evaluation on test data
-logit_diff_val, kl_val = evaluate_graph(model, g, test_dataloader, eval_metrics,skip_clean=False)
-logit_diff_val = logit_diff_val.mean().item()
-kl_val = kl_val.mean().item()
-print(f"Found minimal circuit with {best_n} ({best_n/len(g.edges):.2%}) edges that maintains {logit_diff_val/baseline_logit_diff:.2%} of baseline performance")
+    path = Path(f"data/results/contrastive_mem_{threshold}_{model_name.split('/')[-1]}_{prompt_tokens}_{generation_tokens}_{metric}_ac.json")
 
-print("Number of included nodes:", g.count_included_nodes())
-g.to_json(f'graph-{MODEL_NAME.split("/")[-1]}-{logit_diff_val:.2f}.json')
-gz = g.to_graphviz(f'graph-{MODEL_NAME.split("/")[-1]}-{logit_diff_val:.2f}.png')
+    model = HookedTransformer.from_pretrained(model_name, device=device)
+    model.cfg.use_split_qkv_input = True
+    model.cfg.use_attn_result = True
+    model.cfg.use_hook_mlp_in = True
+
+    ds = EAPDataset(path, model.tokenizer) 
+    # Create train and test dataloaders
+    train_dataloader, test_dataloader = ds.to_dataloader(batch_size=batch_size, test_size=0.1, seed=42) 
+
+
+    # Evaluate baseline on the test data
+    baseline_logit_diff = evaluate_baseline(model, test_dataloader, partial(logit_diff, loss=False, mean=False)).mean().item()
+    print(f"Baseline logit_diff: {baseline_logit_diff}")
+
+    g = Graph.from_model(model)
+    # Attribute using the training data
+    attribute(model, g, train_dataloader, 
+            partial(logit_diff, loss=True, mean=True),
+            method='EAP-IG-activations',
+            ig_steps=5)
+
+    eval_metrics = [partial(logit_diff, loss=False, mean=False),partial(kl_div_, loss=False, mean=False)]
+
+    g, best_edges = find_minimal_circuit(model, g, test_dataloader, eval_metrics, target_performance_pct=0.8)
+    # Final evaluation on test data
+    logit_diff_val, kl_val = evaluate_graph(model, g, test_dataloader, eval_metrics,skip_clean=False)
+    logit_diff_val = logit_diff_val.mean().item()
+    kl_val = kl_val.mean().item()
+    print(f"Found minimal circuit with {best_edges} ({best_edges/len(g.edges):.2%}) edges that maintains {logit_diff_val/baseline_logit_diff:.2%} of baseline performance")
+
+    print("Number of included nodes:", g.count_included_nodes())
+    g.to_json(f'graph-{model_name.split("/")[-1]}-{logit_diff_val:.2f}.json')
+    gz = g.to_graphviz(f'graph-{model_name.split("/")[-1]}-{logit_diff_val:.2f}.png')

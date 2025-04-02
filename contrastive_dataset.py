@@ -215,6 +215,9 @@ if __name__ == "__main__":
     parser.add_argument("--threshold", type=float, default=0.5, help="Memorization score threshold")
     parser.add_argument("--metric", type=str, default="bleu", choices=["memorization", "bleu"], help="Benchmark metric to use: 'memorization' for exact memorization or 'bleu' for approximate memorization")
     parser.add_argument("--model_name", type=str, default="EleutherAI/pythia-70m-deduped", help="Model to use")
+    parser.add_argument("--prompt_tokens", type=int, default=32, help="Number of tokens to use as prompt")
+    parser.add_argument("--generation_tokens", type=int, default=96, help="Number of tokens to generate")
+
     
     args = parser.parse_args()
     
@@ -222,8 +225,10 @@ if __name__ == "__main__":
     threshold = args.threshold
     metric = args.metric
     model_name = args.model_name
+    prompt_tokens = args.prompt_tokens
+    generation_tokens = args.generation_tokens
 
-    df = pd.read_json("data/results/memorization_scores_pythia-70m-deduped_32_32.json")
+    df = pd.read_json(f"data/results/memorization_scores_{model_name.split('/')[-1]}_{prompt_tokens}_{generation_tokens}.json")
 
     mem_df = df[df['memorization_score'] > threshold]
     mem_df = mem_df.sort_values('memorization_score', ascending=False)
@@ -236,7 +241,7 @@ if __name__ == "__main__":
     # Instead of processing everything at once, let's chunk it
     batches = [mem_df.iloc[i:i+batch_size] for i in range(0, len(mem_df), batch_size)]
 
-    path = Path(f"data/results/contrastive_mem_{threshold}_{model_name.split('/')[-1]}_{metric}.jsonl")
+    path = Path(f"data/results/contrastive_mem_{threshold}_{model_name.split('/')[-1]}_{prompt_tokens}_{generation_tokens}_{metric}.jsonl")
 
     if path.exists():
         with open(path, 'r') as f:
