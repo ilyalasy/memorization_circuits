@@ -8,6 +8,7 @@ from transformers import PreTrainedTokenizer
 from transformer_lens import HookedTransformer
 import json
 from pathlib import Path
+from torch.nn.functional import kl_div
 
 device = torch.device("cuda" if torch.cuda.is_available() else "mps")
 from eap.graph import Graph
@@ -107,14 +108,11 @@ def logit_diff(logits: torch.Tensor, clean_logits: torch.Tensor, input_length: t
         results = results.mean()
     return results
 
-def kl_div(logits: torch.Tensor, clean_logits: torch.Tensor, input_length: torch.Tensor, labels: torch.Tensor, mean=True, loss=True):
+def kl_div_(logits: torch.Tensor, clean_logits: torch.Tensor, input_length: torch.Tensor, labels: torch.Tensor, mean=True, loss=True):
     logits = get_logit_positions(logits, input_length)
     clean_logits = get_logit_positions(clean_logits, input_length)
 
-    probs = torch.softmax(logits, dim=-1)
-    clean_probs = torch.softmax(clean_logits, dim=-1)
-
-    results = kl_div(probs.log(), clean_probs.log(), log_target=True, reduction='none').mean(-1)
+    results = kl_div(logits.log_softmax(dim=-1), clean_logits.softmax(dim=-1), reduction='none').mean(-1)
     return results.mean() if mean else results
 
 
@@ -130,6 +128,11 @@ ds = EAPDataset(path, model.tokenizer)
 # Create train and test dataloaders
 train_dataloader, test_dataloader = ds.to_dataloader(batch_size=32, test_size=0.1, seed=42) 
 
+
+# Evaluate baseline on the test data
+baseline_logit_diff = evaluate_baseline(model, test_dataloader, partial(logit_diff, loss=False, mean=False)).mean().item()
+print(f"Baseline logit_diff: {baseline_logit_diff}")
+
 g = Graph.from_model(model)
 # Attribute using the training data
 attribute(model, g, train_dataloader, 
@@ -137,39 +140,39 @@ attribute(model, g, train_dataloader,
           method='EAP-IG-activations',
           ig_steps=5)
 
-# Evaluate baseline on the test data
-baseline = evaluate_baseline(model, test_dataloader, partial(logit_diff, loss=False, mean=False)).mean().item()
-print(f"Baseline performance: {baseline}")
-
-
 # Find minimal circuit that maintains 80% performance of baseline
 # Evaluation is done on the test set
-target_performance = 0.8 * baseline
-best_n = 3000  # Start with a large number
+target_performance = 0.8 * baseline_logit_diff
+best_n = len(g.edges)  # Start with a total number of edges
 min_n = 1
-max_n = 3000
+max_n = best_n
 step = 10
 
+eval_metrics = [partial(logit_diff, loss=False, mean=False),partial(kl_div_, loss=False, mean=False)]
 # Binary search to find minimal circuit
 while min_n <= max_n:
     n = (min_n + max_n) // 2    
     g.apply_topn(n, True)
     # Evaluate on test data
-    performance = evaluate_graph(model, g, test_dataloader, partial(logit_diff, loss=False, mean=False)).mean().item()
+    performance, kl_performance = evaluate_graph(model, g, test_dataloader, eval_metrics,skip_clean=False)
+    performance = performance.mean().item()
+    kl_performance = kl_performance.mean().item()
     
     if performance >= target_performance:
         best_n = n
         max_n = n - step  # Try smaller
     else:
         min_n = n + step  # Try larger
-    print(f"n: {n}, performance: {performance}")
+    print(f"edges: {n}, logit_diff: {performance:.2f}, kl_div: {kl_performance}")
 
 # Apply the minimal circuit size that maintains performance
 g.apply_topn(best_n, True)
 # Final evaluation on test data
-results = evaluate_graph(model, g, test_dataloader, partial(logit_diff, loss=False, mean=False)).mean().item()
-print(f"Found minimal circuit with {best_n} edges that maintains {results/baseline:.2%} of baseline performance")
+logit_diff_val, kl_val = evaluate_graph(model, g, test_dataloader, eval_metrics,skip_clean=False)
+logit_diff_val = logit_diff_val.mean().item()
+kl_val = kl_val.mean().item()
+print(f"Found minimal circuit with {best_n} ({best_n/len(g.edges):.2%}) edges that maintains {logit_diff_val/baseline_logit_diff:.2%} of baseline performance")
 
 print("Number of included nodes:", g.count_included_nodes())
-g.to_json(f'graph-{MODEL_NAME.split("/")[-1]}-{results}.json')
-gz = g.to_graphviz(f'graph-{MODEL_NAME.split("/")[-1]}-{results}.png')
+g.to_json(f'graph-{MODEL_NAME.split("/")[-1]}-{logit_diff_val:.2f}.json')
+gz = g.to_graphviz(f'graph-{MODEL_NAME.split("/")[-1]}-{logit_diff_val:.2f}.png')
