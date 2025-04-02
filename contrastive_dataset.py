@@ -103,7 +103,7 @@ def find_minimum_context_for_memorization(model: AutoModelForCausalLM,
         for batch_i in range(len(decoded_completion)):
             # calculate bleu score only if we haven't found the minimum context length yet
             if t.isnan(min_context_len[batch_i]):
-                bleu_result = bleu.compute(predictions=[decoded_completion[batch_i]], references=[decoded_gt[batch_i]],max_order=4)
+                bleu_result = bleu.compute(predictions=[decoded_completion[batch_i]], references=[decoded_gt[batch_i]],tokenizer=tokenizer,max_order=4)
                 bleu_scores.append(bleu_result['bleu'])
             else:
                 bleu_scores.append(previous_scores[batch_i])
