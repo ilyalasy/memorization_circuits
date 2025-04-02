@@ -2,7 +2,8 @@ from functools import partial
 
 import pandas as pd
 import torch
-from torch.utils.data import Dataset, DataLoader
+from torch.utils.data import Dataset, DataLoader, random_split
+from torch import Generator
 from transformers import PreTrainedTokenizer
 from transformer_lens import HookedTransformer
 import json
@@ -36,7 +37,7 @@ class EAPDataset(Dataset):
         # Drop original list columns
         self.df.drop(columns=['answers', 'wrong_answers'], inplace=True, errors='ignore')
         if 'label' in self.df.columns:
-                self.df.drop(columns=['label'], inplace=True)
+            self.df.drop(columns=['label'], inplace=True)
 
         # --- Pre-tokenize answers --- 
         correct_answers = self.df['correct_answer'].tolist()
@@ -71,9 +72,23 @@ class EAPDataset(Dataset):
         # Return clean, corrupted, and the tuple of token IDs
         return row['clean'], row['corrupted'], (row['correct_token_id'], row['incorrect_token_id'])
     
-    def to_dataloader(self, batch_size: int): # No tokenizer needed here
+    def to_dataloader(self, batch_size: int, test_size: float = 0.1, seed: int = 42): # No tokenizer needed here
+        """Splits the dataset into train and test sets and returns corresponding dataloaders."""
+        dataset_size = len(self)
+        test_split_size = int(test_size * dataset_size)
+        train_split_size = dataset_size - test_split_size
+
+        # Use a generator for reproducible splits
+        generator = Generator().manual_seed(seed)
+        train_dataset, test_dataset = random_split(
+            self, [train_split_size, test_split_size], generator=generator
+        )
+
         # Pass the simplified collate_EAP directly
-        return DataLoader(self, batch_size=batch_size, collate_fn=collate_EAP)
+        train_loader = DataLoader(train_dataset, batch_size=batch_size, collate_fn=collate_EAP)
+        test_loader = DataLoader(test_dataset, batch_size=batch_size, collate_fn=collate_EAP)
+        
+        return train_loader, test_loader
 
 def get_logit_positions(logits: torch.Tensor, input_length: torch.Tensor):
     batch_size = logits.size(0)
@@ -112,30 +127,35 @@ model.cfg.use_attn_result = True
 model.cfg.use_hook_mlp_in = True
 
 ds = EAPDataset(path, model.tokenizer) 
-dataloader = ds.to_dataloader(32)
+# Create train and test dataloaders
+train_dataloader, test_dataloader = ds.to_dataloader(batch_size=32, test_size=0.1, seed=42) 
 
 g = Graph.from_model(model)
-attribute(model, g, dataloader, 
+# Attribute using the training data
+attribute(model, g, train_dataloader, 
           partial(logit_diff, loss=True, mean=True),
           method='EAP-IG-activations',
           ig_steps=5)
 
-baseline = evaluate_baseline(model, dataloader, partial(logit_diff, loss=False, mean=False)).mean().item()
-baseline
+# Evaluate baseline on the test data
+baseline = evaluate_baseline(model, test_dataloader, partial(logit_diff, loss=False, mean=False)).mean().item()
+print(f"Baseline performance: {baseline}")
 
 
 # Find minimal circuit that maintains 80% performance of baseline
+# Evaluation is done on the test set
 target_performance = 0.8 * baseline
-best_n = 200  # Start with a large number
+best_n = 3000  # Start with a large number
 min_n = 1
-max_n = 200
+max_n = 3000
 step = 10
 
 # Binary search to find minimal circuit
 while min_n <= max_n:
     n = (min_n + max_n) // 2    
     g.apply_topn(n, True)
-    performance = evaluate_graph(model, g, dataloader, partial(logit_diff, loss=False, mean=False)).mean().item()
+    # Evaluate on test data
+    performance = evaluate_graph(model, g, test_dataloader, partial(logit_diff, loss=False, mean=False)).mean().item()
     
     if performance >= target_performance:
         best_n = n
@@ -146,16 +166,10 @@ while min_n <= max_n:
 
 # Apply the minimal circuit size that maintains performance
 g.apply_topn(best_n, True)
-results = evaluate_graph(model, g, dataloader, partial(logit_diff, loss=False, mean=False)).mean().item()
+# Final evaluation on test data
+results = evaluate_graph(model, g, test_dataloader, partial(logit_diff, loss=False, mean=False)).mean().item()
 print(f"Found minimal circuit with {best_n} edges that maintains {results/baseline:.2%} of baseline performance")
 
-# %%
-g.count_included_nodes()
-
-# %%
-g.apply_topn(86, True)
-results = evaluate_graph(model, g, dataloader, partial(logit_diff, loss=False, mean=False)).mean().item()
-g.to_json(f'graph-{MODEL_NAME.split("/")[-1]}-{results/baseline:.2%}.json')
-
-# %%
-gz = g.to_graphviz(f'graph-{MODEL_NAME.split("/")[-1]}-{results/baseline:.2%}.png')
+print("Number of included nodes:", g.count_included_nodes())
+g.to_json(f'graph-{MODEL_NAME.split("/")[-1]}-{results}.json')
+gz = g.to_graphviz(f'graph-{MODEL_NAME.split("/")[-1]}-{results}.png')
