@@ -7,7 +7,7 @@ from auto_circuit.experiment_utils import load_tl_model
 from auto_circuit.types import AblationType, PatchType, PruneScores
 from auto_circuit.utils.graph_utils import patchable_model,edge_counts_util
 from auto_circuit.data import load_datasets_from_json
-from auto_circuit.utils.tensor_ops import prune_scores_threshold
+from auto_circuit.utils.tensor_ops import desc_prune_scores, prune_scores_threshold
 from auto_circuit.prune_algos.mask_gradient import mask_gradient_prune_scores
 from auto_circuit.prune import run_circuits
 from auto_circuit.metrics.prune_metrics.answer_diff import measure_answer_diff
@@ -46,24 +46,38 @@ model = patchable_model(
 
 train_loader, test_loader = load_datasets_from_json(model,path,device,return_seq_length=False,tail_divergence=False,train_test_size=(train_size,test_size),batch_size=8)
 
-path = Path(f"data/circuits/{MODEL_NAME.split('/')[-1]}_mem_prune_scores.pkl")
+ig = 5
+ablation_type = AblationType.RESAMPLE
+patch_type = PatchType.EDGE_PATCH
+
+path = Path(f"data/circuits/{MODEL_NAME.split('/')[-1]}_mem_prune_scores_ig{ig}.pkl")
 if path.exists():
     prune_scores: PruneScores = t.load(path, weights_only=False)
 else:
+    if ig is None:
+        mask_val = 0.0
+    else:
+        mask_val = None
+
     prune_scores: PruneScores = mask_gradient_prune_scores(
         model=model,
         dataloader=train_loader,
         official_edges=None,
         grad_function="logit",
         answer_function="avg_diff",
-        mask_val=0.0, 
-        ablation_type=AblationType.RESAMPLE
+        mask_val=mask_val, 
+        integrated_grad_samples=ig,
+        ablation_type=ablation_type
     )
     t.save(prune_scores, path)
 
 edge_count = edge_counts_util(model.edges, prune_scores=prune_scores)
-outs = run_circuits(model,test_loader,edge_count,prune_scores,ablation_type=AblationType.RESAMPLE,patch_type=PatchType.TREE_PATCH)
-measurements = measure_answer_diff(model,test_loader,outs)
+outs = run_circuits(model,test_loader,edge_count,prune_scores,ablation_type=ablation_type,patch_type=patch_type)
+measurements = measure_answer_diff(model, test_loader, outs)
+
+with open(f"data/circuits/metrics_ig{ig}_p{patch_type.name}.json", 'w') as f:
+    json.dump(dict(measurements), f,indent=2)
+
 
 min_edge_count, min_metric = find_min_circuit(measurements)
 threshold = prune_scores_threshold(prune_scores, min_edge_count)
