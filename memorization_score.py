@@ -35,7 +35,7 @@ def calculate_memorization_score(model:AutoModelForCausalLM, tokenizer:AutoToken
     # Process dataset in batches
     batches = dataset.batch(batch_size=batch_size)
         
-    for batch in tqdm(batches, total=len(batches), desc="Processing Wikipedia dataset"):
+    for batch in tqdm(batches, total=len(batches), desc="Processing dataset"):
         batch_texts = tokenizer(batch["text"], padding=True, return_tensors="pt")
         tokens = batch_texts["input_ids"].to(device)
             
@@ -103,7 +103,7 @@ def main():
     prompt_tokens = args.prompt_tokens
     generation_tokens = args.generation_tokens
     batch_size = args.batch_size
-    dataset = args.dataset
+    dataset_name = args.dataset
     output_dir = Path(args.output_dir)
     
     # Create output directory if it doesn't exist
@@ -115,12 +115,12 @@ def main():
     tokenizer.pad_token_id = tokenizer.eos_token_id
     tokenizer.padding_side = 'right'
     
-    print(f"Loading dataset: {dataset}")
-    dataset = load_dataset(dataset, split="train") #streaming=True
+    print(f"Loading dataset: {dataset_name}")
+    dataset = load_dataset(dataset_name, split="train") #streaming=True
     
     print(f"Calculating memorization score (prompt: {prompt_tokens} tokens, generate: {generation_tokens} tokens)")
     
-    dataset_short_name = dataset.split('/')[-1]
+    dataset_short_name = dataset_name.split('/')[-1]
     model_short_name = model_name.split('/')[-1]
     
     path = output_dir / f"mem_scores_{dataset_short_name}_{model_short_name}_{prompt_tokens}_{generation_tokens}.json"
