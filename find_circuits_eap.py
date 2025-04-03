@@ -151,25 +151,17 @@ def find_minimal_circuit(model: HookedTransformer, g: Graph, test_dataloader: Da
 
 if __name__ == "__main__":    
     parser = argparse.ArgumentParser(description="Generate contrastive dataset")
-    parser.add_argument("--batch_size", type=int, default=32, help="Batch size for processing")
-    parser.add_argument("--threshold", type=float, default=0.5, help="Memorization score threshold")
-    parser.add_argument("--metric", type=str, default="bleu", choices=["memorization", "bleu"], help="Benchmark metric to use: 'memorization' for exact memorization or 'bleu' for approximate memorization")
-    parser.add_argument("--model_name", type=str, default="EleutherAI/pythia-70m-deduped", help="Model to use")
-    parser.add_argument("--prompt_tokens", type=int, default=32, help="Number of tokens to use as prompt")
-    parser.add_argument("--generation_tokens", type=int, default=96, help="Number of tokens to generate")
+    parser.add_argument("--batch_size", type=int, default=64, help="Batch size for processing")    
+    parser.add_argument("--model_name", type=str, default="EleutherAI/gpt-neo-125m", help="Model to use")
+    parser.add_argument("--path", type=str, default="data/results/contrastive_mem_0.5_gpt-neo-125m_50_50_bleu_filtered100.json", help="Path to the contrastive dataset")
     
     args = parser.parse_args()
     
     batch_size = args.batch_size
-    threshold = args.threshold
-    metric = args.metric
     model_name = args.model_name
-    prompt_tokens = args.prompt_tokens
-    generation_tokens = args.generation_tokens
+    path = Path(args.path)
 
-    path = Path(f"data/results/contrastive_mem_{threshold}_{model_name.split('/')[-1]}_{prompt_tokens}_{generation_tokens}_{metric}_ac.json")
-
-    model = HookedTransformer.from_pretrained(model_name, device=device)
+    model = HookedTransformer.from_pretrained(model_name, device=device,dtype="float16")
     model.cfg.use_split_qkv_input = True
     model.cfg.use_attn_result = True
     model.cfg.use_hook_mlp_in = True

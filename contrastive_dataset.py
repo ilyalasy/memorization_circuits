@@ -328,7 +328,7 @@ if __name__ == "__main__":
 
     if path.exists():
         with open(path, 'r') as f:
-            all_sequences = json.load(f)
+            all_sequences = json.load(f)["prompts"]
         print(f"Loaded {len(all_sequences)} contrastive pairs from {path}")
         exit()
 
