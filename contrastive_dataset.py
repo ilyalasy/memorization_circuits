@@ -13,8 +13,10 @@ from metrics.nmt_bleu import compute_bleu
 from typing import Literal
 
 import torch as t
-from auto_circuit.data import PromptDataLoader, PromptDataset
-from torch.utils.data import Subset
+
+from sentence_transformers import SentenceTransformer
+import numpy as np
+from tqdm import tqdm
 
 # pandarallel.initialize(nb_workers=16,progress_bar=True)
 
@@ -209,15 +211,106 @@ def save_autocircuit_ds(all_sequences:dict, path:Path, tokenizer:AutoTokenizer):
     print(f"Saved AutoCircuit dataset with {len(autocircuit_data['prompts'])} prompt pairs to {path}")
 
 
+def create_contrastive_pairs(df: pd.DataFrame, 
+                             tokenizer: AutoTokenizer,
+                             high_threshold: float = 0.75, 
+                             low_threshold: float = 0.0, 
+                             max_pairs: int = 1000, batch_size=32) -> list:
+    """
+    Create contrastive pairs of examples with high and low memorization scores
+    that are semantically similar to each other.
+    
+    Args:
+        df: DataFrame with memorization data
+        tokenizer: Tokenizer to use for encoding/decoding
+        high_threshold: Minimum memorization score for "clean" examples
+        low_threshold: Maximum memorization score for "corrupt" examples
+        max_pairs: Maximum number of pairs to create
+        batch_size: Batch size for embedding generation
+        
+    Returns:
+        List of dictionaries with contrastive pairs
+    """
+    
+    # Split df into high and low memorization groups
+    high_mem_df = df[df['memorization_score'] >= high_threshold].reset_index()
+    low_mem_df = df[df['memorization_score'] <= low_threshold].reset_index()
+    
+    print(f"High memorization examples: {len(high_mem_df)}")
+    print(f"Low memorization examples: {len(low_mem_df)}")
+    
+    if len(high_mem_df) == 0 or len(low_mem_df) == 0:
+        print("Not enough examples in one of the groups.")
+        return []
+    
+    # Load sentence transformer model for semantic similarity calculation
+    print("Loading sentence embedding model...")
+    model = SentenceTransformer('all-MiniLM-L6-v2') #all-mpnet-base-v2
+    
+    # Create embeddings for contexts
+    print("Generating embeddings for high memorization examples...")
+    high_contexts = high_mem_df['decoded_context'].tolist()
+    high_embeddings = model.encode(high_contexts, show_progress_bar=True, convert_to_tensor=True, batch_size=batch_size)
+    
+    print("Generating embeddings for low memorization examples...")
+    low_contexts = low_mem_df['decoded_context'].tolist()
+    low_embeddings = model.encode(low_contexts, show_progress_bar=True, convert_to_tensor=True, batch_size=batch_size)
+    
+    # Find most similar pairs
+    print("Finding most similar pairs...")
+    contrastive_pairs = []
+    
+    # Keep track of used low memorization examples
+    available_mask = t.ones(len(low_mem_df))
+    
+    # For each high memorization example, find the most similar unused low memorization example
+    for i in tqdm(range(min(len(high_mem_df), max_pairs))):
+        # Calculate cosine similarity between current high embedding and all low embeddings
+        similarities = t.nn.functional.cosine_similarity(high_embeddings[i].unsqueeze(0), low_embeddings).cpu()
+        
+        # Mask out similarities of already used low examples
+        similarities_masked = similarities * available_mask
+        
+        # If all low examples have been used, skip this high example
+        if similarities_masked.sum() == 0:
+            print(f"Warning: All low memorization examples have been used. Created {len(contrastive_pairs)} pairs.")
+            break
+        
+        # Get the index of the most similar available low example
+        most_similar_idx = t.argmax(similarities_masked).item()
+        similarity_score = similarities[most_similar_idx]
+        
+        # Mark this low example as used
+        available_mask[most_similar_idx] = 0
+        
+        # Create contrastive pair
+        pair = {
+            'clean': high_mem_df.iloc[i]['decoded_context'],
+            "corrupt": low_mem_df.iloc[most_similar_idx]['decoded_context'],
+            "answers": [tokenizer.batch_decode(high_mem_df.iloc[i]['completion'])[0]],
+            "wrong_answers": [tokenizer.batch_decode(low_mem_df.iloc[most_similar_idx]['completion'])[0]],          
+            'similarity_score': float(similarity_score)
+        }
+        
+        contrastive_pairs.append(pair)
+    
+    # Sort by similarity score
+    contrastive_pairs.sort(key=lambda x: x['similarity_score'], reverse=True)
+    
+    print(f"Created {len(contrastive_pairs)} contrastive pairs")
+    return {'prompts': contrastive_pairs}
+
+
 if __name__ == "__main__":    
     parser = argparse.ArgumentParser(description="Generate contrastive dataset")
-    parser.add_argument("--batch_size", type=int, default=8, help="Batch size for processing")
-    parser.add_argument("--threshold", type=float, default=0.5, help="Memorization score threshold")
+    parser.add_argument("--batch_size", type=int, default=32, help="Batch size for processing")
+    parser.add_argument("--threshold", type=float, default=0.75, help="Memorization score threshold")
     parser.add_argument("--metric", type=str, default="bleu", choices=["memorization", "bleu"], help="Benchmark metric to use: 'memorization' for exact memorization or 'bleu' for approximate memorization")
     parser.add_argument("--model_name", type=str, default="EleutherAI/gpt-neo-125m", help="Model to use")
     parser.add_argument("--prompt_tokens", type=int, default=50, help="Number of tokens to use as prompt")
     parser.add_argument("--generation_tokens", type=int, default=50, help="Number of tokens to generate")
-
+    parser.add_argument("--contrastive_mode", type=str, default="dataset", choices=["divergence", "dataset"], 
+                        help="Whether to create contrastive pairs based on the token divergence position or take pairs of memorized vs non-memorized examples")
     
     args = parser.parse_args()
     
@@ -226,32 +319,48 @@ if __name__ == "__main__":
     metric = args.metric
     model_name = args.model_name
     prompt_tokens = args.prompt_tokens
-    generation_tokens = args.generation_tokens
+    generation_tokens = args.generation_tokens    
+    contrastive_mode = args.contrastive_mode
 
     df = pd.read_json(f"data/results/memorization_scores_{model_name.split('/')[-1]}_{prompt_tokens}_{generation_tokens}.json")
 
-    mem_df = df[df['memorization_score'] > threshold]
-    mem_df = mem_df.sort_values('memorization_score', ascending=False)
-
-    tokenizer = AutoTokenizer.from_pretrained(model_name)
-    model = AutoModelForCausalLM.from_pretrained(model_name).to(device)
-
-    if device.type == "cuda":
-        model = model.half()
-    # Instead of processing everything at once, let's chunk it
-    batches = [mem_df.iloc[i:i+batch_size] for i in range(0, len(mem_df), batch_size)]
-
-    path = Path(f"data/results/contrastive_mem_{threshold}_{model_name.split('/')[-1]}_{prompt_tokens}_{generation_tokens}_{metric}.jsonl")
+    path = Path(f"data/results/contrastive_mem_{threshold}_{model_name.split('/')[-1]}_{prompt_tokens}_{generation_tokens}_{metric}_{contrastive_mode}.json")
 
     if path.exists():
         with open(path, 'r') as f:
-            all_sequences = [json.loads(line) for line in f]
-    else:
+            all_sequences = json.load(f)
+        print(f"Loaded {len(all_sequences)} contrastive pairs from {path}")
+        exit()
+
+    tokenizer = AutoTokenizer.from_pretrained(model_name)
+    if contrastive_mode == "divergence":
+        mem_df = df[df['memorization_score'] > threshold]
+        mem_df = mem_df.sort_values('memorization_score', ascending=False)
+
+        model = AutoModelForCausalLM.from_pretrained(model_name).to(device)
+
+        if device.type == "cuda":
+            model = model.half()
+        # Instead of processing everything at once, let's chunk it
+        batches = [mem_df.iloc[i:i+batch_size] for i in range(0, len(mem_df), batch_size)]
         all_sequences = defaultdict(list)
         for batch in tqdm(batches,desc="Processing batches"):
             sequences = find_minimum_context_for_memorization(model,batch,tokenizer,benchmark_metric=metric)
             for key in sequences:
                 all_sequences[key].extend(sequences[key])
         
-        save_autocircuit_ds(all_sequences,path.with_name(f"{path.stem}_ac.json"),tokenizer)
-        save_jsonl(all_sequences,path,tokenizer)
+        save_autocircuit_ds(all_sequences,path,tokenizer)
+        save_jsonl(all_sequences,path.with_name(f"{path.stem}.jsonl"),tokenizer)
+
+    elif contrastive_mode=="dataset":
+        contrastive_pairs = create_contrastive_pairs(
+                df=df,
+                high_threshold=threshold,
+                tokenizer=tokenizer,
+                batch_size=batch_size
+            )
+        # Save the dataset
+        with open(path, 'w') as f:
+            json.dump(contrastive_pairs, f, indent=2)
+        
+        print(f"Saved AutoCircuit dataset with {len(contrastive_pairs['prompts'])} prompt pairs to {path}")
