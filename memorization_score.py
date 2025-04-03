@@ -103,6 +103,7 @@ def main():
     prompt_tokens = args.prompt_tokens
     generation_tokens = args.generation_tokens
     batch_size = args.batch_size
+    dataset = args.dataset
     
     print(f"Loading model: {model_name}")
     model = AutoModelForCausalLM.from_pretrained(model_name, torch_dtype=torch.float16) # torch_dtype=torch.float16
@@ -110,12 +111,12 @@ def main():
     tokenizer.pad_token_id = tokenizer.eos_token_id
     tokenizer.padding_side = 'right'
     
-    print(f"Loading dataset: {args.dataset}")
-    dataset = load_dataset(args.dataset, split="train") #streaming=True
+    print(f"Loading dataset: {dataset}")
+    dataset = load_dataset(dataset, split="train") #streaming=True
     
     print(f"Calculating memorization score (prompt: {prompt_tokens} tokens, generate: {generation_tokens} tokens)")
     
-    path = Path(f"{args.output_dir}/memorization_scores_{model_name.split('/')[-1]}_{prompt_tokens}_{generation_tokens}.json")
+    path = Path(f"{args.output_dir}/mem_scores_{dataset.split('/')[-1]}_{model_name.split('/')[-1]}_{prompt_tokens}_{generation_tokens}.json")
     if path.exists():
         results_df = pd.read_json(path, orient='records')
         print(f"Loaded existing results from {path}")

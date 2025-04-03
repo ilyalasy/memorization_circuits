@@ -303,6 +303,7 @@ def create_contrastive_pairs(df: pd.DataFrame,
 
 if __name__ == "__main__":    
     parser = argparse.ArgumentParser(description="Generate contrastive dataset")
+    parser.add_argument("--dataset", type=str, default="timaeus/pile-wikipedia_en", help="Dataset to use")
     parser.add_argument("--batch_size", type=int, default=32, help="Batch size for processing")
     parser.add_argument("--threshold", type=float, default=0.75, help="Memorization score threshold")
     parser.add_argument("--metric", type=str, default="bleu", choices=["memorization", "bleu"], help="Benchmark metric to use: 'memorization' for exact memorization or 'bleu' for approximate memorization")
@@ -318,13 +319,18 @@ if __name__ == "__main__":
     threshold = args.threshold
     metric = args.metric
     model_name = args.model_name
+    short_model_name = model_name.split('/')[-1]
+    dataset = args.dataset
+    short_dataset = dataset.split('/')[-1]
+    
     prompt_tokens = args.prompt_tokens
     generation_tokens = args.generation_tokens    
     contrastive_mode = args.contrastive_mode
 
-    df = pd.read_json(f"data/results/memorization_scores_{model_name.split('/')[-1]}_{prompt_tokens}_{generation_tokens}.json")
 
-    path = Path(f"data/results/contrastive_mem_{threshold}_{model_name.split('/')[-1]}_{prompt_tokens}_{generation_tokens}_{metric}_{contrastive_mode}.json")
+    df = pd.read_json(f"data/results/mem_scores_{short_dataset}_{short_model_name}_{prompt_tokens}_{generation_tokens}.json")
+
+    path = Path(f"data/results/contrastive_{short_dataset}_{threshold}_{short_model_name}_{prompt_tokens}_{generation_tokens}_{metric}_{contrastive_mode}.json")
 
     if path.exists():
         with open(path, 'r') as f:
