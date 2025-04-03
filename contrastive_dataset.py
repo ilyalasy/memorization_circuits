@@ -312,6 +312,7 @@ if __name__ == "__main__":
     parser.add_argument("--generation_tokens", type=int, default=50, help="Number of tokens to generate")
     parser.add_argument("--contrastive_mode", type=str, default="dataset", choices=["divergence", "dataset"], 
                         help="Whether to create contrastive pairs based on the token divergence position or take pairs of memorized vs non-memorized examples")
+    parser.add_argument("--output_dir", type=str, default="data/results", help="Directory to save results")
     
     args = parser.parse_args()
     
@@ -322,15 +323,29 @@ if __name__ == "__main__":
     short_model_name = model_name.split('/')[-1]
     dataset = args.dataset
     short_dataset = dataset.split('/')[-1]
+    output_dir = args.output_dir
     
     prompt_tokens = args.prompt_tokens
     generation_tokens = args.generation_tokens    
     contrastive_mode = args.contrastive_mode
 
+    # Create output directory if it doesn't exist
+    Path(output_dir).mkdir(parents=True, exist_ok=True)
 
-    df = pd.read_json(f"data/results/mem_scores_{short_dataset}_{short_model_name}_{prompt_tokens}_{generation_tokens}.json")
+    # Get the memorization scores file
+    mem_scores_file = Path(f"{output_dir}/mem_scores_{short_dataset}_{short_model_name}_{prompt_tokens}_{generation_tokens}.json")
+    
+    # Check if the file exists in the dataset folder
+    if not mem_scores_file.exists():
+        # Try looking in the parent results directory
+        mem_scores_file = Path(f"data/results/mem_scores_{short_dataset}_{short_model_name}_{prompt_tokens}_{generation_tokens}.json")
+        if not mem_scores_file.exists():
+            raise FileNotFoundError(f"Could not find memorization scores file at {mem_scores_file}")
 
-    path = Path(f"data/results/contrastive_{short_dataset}_{threshold}_{short_model_name}_{prompt_tokens}_{generation_tokens}_{metric}_{contrastive_mode}.json")
+    df = pd.read_json(mem_scores_file)
+
+    # Output path for contrastive dataset
+    path = Path(f"{output_dir}/contrastive_{short_dataset}_{threshold}_{short_model_name}_{prompt_tokens}_{generation_tokens}_{metric}_{contrastive_mode}.json")
 
     if path.exists():
         with open(path, 'r') as f:

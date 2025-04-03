@@ -154,12 +154,17 @@ if __name__ == "__main__":
     parser.add_argument("--batch_size", type=int, default=64, help="Batch size for processing")    
     parser.add_argument("--model_name", type=str, default="EleutherAI/gpt-neo-125m", help="Model to use")
     parser.add_argument("--path", type=str, default="data/results/contrastive_mem_0.5_gpt-neo-125m_50_50_bleu_filtered100.json", help="Path to the contrastive dataset")
+    parser.add_argument("--output_dir", type=str, default="data/circuits", help="Directory to save circuit results")
     
     args = parser.parse_args()
     
     batch_size = args.batch_size
     model_name = args.model_name
     path = Path(args.path)
+    output_dir = Path(args.output_dir)
+    
+    # Create output directory if it doesn't exist
+    output_dir.mkdir(parents=True, exist_ok=True)    
 
     model = HookedTransformer.from_pretrained(model_name, device=device,dtype="float16")
     model.cfg.use_split_qkv_input = True
@@ -192,5 +197,11 @@ if __name__ == "__main__":
     print(f"Found minimal circuit with {best_edges} ({best_edges/len(g.edges):.2%}) edges that maintains {logit_diff_val/baseline_logit_diff:.2%} of baseline performance")
 
     print("Number of included nodes:", g.count_included_nodes())
-    g.to_json(f'graph-{model_name.split("/")[-1]}-{logit_diff_val:.2f}.json')
-    gz = g.to_graphviz(f'graph-{model_name.split("/")[-1]}-{logit_diff_val:.2f}.png')
+    
+    # Generate filenames with dataset info
+    circuit_json = output_dir / f'graph-{path.stem}.json'
+    circuit_viz = output_dir / f'graph-{path.stem}.png'
+    
+    # Save circuit
+    g.to_json(str(circuit_json))
+    gz = g.to_graphviz(str(circuit_viz))

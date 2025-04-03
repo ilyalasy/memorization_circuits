@@ -104,6 +104,10 @@ def main():
     generation_tokens = args.generation_tokens
     batch_size = args.batch_size
     dataset = args.dataset
+    output_dir = Path(args.output_dir)
+    
+    # Create output directory if it doesn't exist
+    output_dir.mkdir(parents=True, exist_ok=True)
     
     print(f"Loading model: {model_name}")
     model = AutoModelForCausalLM.from_pretrained(model_name, torch_dtype=torch.float16) # torch_dtype=torch.float16
@@ -116,7 +120,11 @@ def main():
     
     print(f"Calculating memorization score (prompt: {prompt_tokens} tokens, generate: {generation_tokens} tokens)")
     
-    path = Path(f"{args.output_dir}/mem_scores_{dataset.split('/')[-1]}_{model_name.split('/')[-1]}_{prompt_tokens}_{generation_tokens}.json")
+    dataset_short_name = dataset.split('/')[-1]
+    model_short_name = model_name.split('/')[-1]
+    
+    path = output_dir / f"mem_scores_{dataset_short_name}_{model_short_name}_{prompt_tokens}_{generation_tokens}.json"
+    
     if path.exists():
         results_df = pd.read_json(path, orient='records')
         print(f"Loaded existing results from {path}")
