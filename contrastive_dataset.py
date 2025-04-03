@@ -9,7 +9,7 @@ from collections import defaultdict
 # from pandarallel import pandarallel
 import json
 
-import evaluate
+from metrics.nmt_bleu import compute_bleu
 from typing import Literal
 
 import torch as t
@@ -18,7 +18,6 @@ from torch.utils.data import Subset
 
 # pandarallel.initialize(nb_workers=16,progress_bar=True)
 
-bleu = evaluate.load("bleu")
 device = t.device("cuda" if t.cuda.is_available() else "mps")
 
 
@@ -91,20 +90,21 @@ def find_minimum_context_for_memorization(model: AutoModelForCausalLM,
         generated_completion = generation_output[:, current_len:]
 
         # decoded_context = tokenizer.batch_decode(current_context)
-        decoded_completion = tokenizer.batch_decode(generated_completion)
-        decoded_gt = tokenizer.batch_decode(whole_samples[:, current_len:])
+        # decoded_completion = tokenizer.batch_decode(generated_completion)
+        # decoded_gt = tokenizer.batch_decode(whole_samples[:, current_len:])
 
         # Calculate memorization score    
         correct_tokens = (generated_completion == whole_samples[:, current_len:]).sum(-1)
         memorization_score = correct_tokens / generated_completion.size(-1)
 
-        # Calculate BLEU-4 score for each sample in the batch
+        # Calculate BLEU-4 score for each sample in the batch        
         bleu_scores = []
-        for batch_i in range(len(decoded_completion)):
+        for batch_i in range(generated_completion.size(0)):
             # calculate bleu score only if we haven't found the minimum context length yet
             if t.isnan(min_context_len[batch_i]):
-                bleu_result = bleu.compute(predictions=[decoded_completion[batch_i]], references=[decoded_gt[batch_i]],tokenizer=tokenizer,max_order=4)
-                bleu_scores.append(bleu_result['bleu'])
+                bleu_result = compute_bleu([[whole_samples[batch_i, current_len:].tolist()]],[generated_completion[batch_i].tolist()],max_order=4, smooth=True)
+                (bleu, precisions, bp, ratio, translation_length, reference_length) = bleu_result
+                bleu_scores.append(bleu)
             else:
                 bleu_scores.append(previous_scores[batch_i])
         bleu_scores = t.tensor(bleu_scores)
@@ -214,9 +214,9 @@ if __name__ == "__main__":
     parser.add_argument("--batch_size", type=int, default=8, help="Batch size for processing")
     parser.add_argument("--threshold", type=float, default=0.5, help="Memorization score threshold")
     parser.add_argument("--metric", type=str, default="bleu", choices=["memorization", "bleu"], help="Benchmark metric to use: 'memorization' for exact memorization or 'bleu' for approximate memorization")
-    parser.add_argument("--model_name", type=str, default="EleutherAI/pythia-70m-deduped", help="Model to use")
-    parser.add_argument("--prompt_tokens", type=int, default=32, help="Number of tokens to use as prompt")
-    parser.add_argument("--generation_tokens", type=int, default=96, help="Number of tokens to generate")
+    parser.add_argument("--model_name", type=str, default="EleutherAI/gpt-neo-125m", help="Model to use")
+    parser.add_argument("--prompt_tokens", type=int, default=50, help="Number of tokens to use as prompt")
+    parser.add_argument("--generation_tokens", type=int, default=50, help="Number of tokens to generate")
 
     
     args = parser.parse_args()
