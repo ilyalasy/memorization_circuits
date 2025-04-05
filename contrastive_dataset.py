@@ -189,17 +189,45 @@ def save_autocircuit_ds(all_sequences:dict, path:Path, tokenizer:AutoTokenizer):
         "prompts": []
     }
     
+    # Track unique prompt pairs to avoid duplicates
+    seen_pairs = set()
+    duplicate_count = 0
+    
     for i in range(len(all_sequences['minimal_context'])):
         # Skip pairs where clean and corrupt are identical
         if all_sequences['next_gt_tokens'][i][0] == all_sequences['next_generated_tokens'][i][0]:
             continue
             
+        clean_tokens = all_sequences['minimal_context'][i].tolist() + [all_sequences['next_gt_tokens'][i][0]]
+        corrupt_tokens = all_sequences['minimal_context'][i].tolist() + [all_sequences['next_generated_tokens'][i][0]]        
+        
+        # Decode tokens to create the pair
+        clean_text = tokenizer.decode(clean_tokens)
+        corrupt_text = tokenizer.decode(corrupt_tokens)
+        answer = tokenizer.decode(all_sequences['next_gt_tokens'][i][1])
+        wrong_answer = tokenizer.decode(all_sequences['next_generated_tokens'][i][1])
+
+        if len(tokenizer(clean_text)["input_ids"]) != len(tokenizer(corrupt_text)["input_ids"]):
+            print(f"Skipping pair {i} because of length mismatch after decoding")
+            continue
+        
+        # Create a unique identifier for this prompt pair
+        pair_key = (clean_text, corrupt_text, answer, wrong_answer)
+        
+        # Skip if we've seen this pair before
+        if pair_key in seen_pairs:
+            duplicate_count += 1
+            continue
+            
+        # Add to seen pairs
+        seen_pairs.add(pair_key)
+        
         # Create a prompt pair
         prompt_pair = {
-            "clean": tokenizer.decode(all_sequences['minimal_context'][i].tolist() + [all_sequences['next_gt_tokens'][i][0]]),
-            "corrupt": tokenizer.decode(all_sequences['minimal_context'][i].tolist() + [all_sequences['next_generated_tokens'][i][0]]),
-            "answers": [tokenizer.decode(all_sequences['next_gt_tokens'][i][1])],
-            "wrong_answers": [tokenizer.decode(all_sequences['next_generated_tokens'][i][1])]
+            "clean": clean_text,
+            "corrupt": corrupt_text,
+            "answers": [answer],
+            "wrong_answers": [wrong_answer]
         }
         
         autocircuit_data["prompts"].append(prompt_pair)
@@ -209,6 +237,8 @@ def save_autocircuit_ds(all_sequences:dict, path:Path, tokenizer:AutoTokenizer):
         json.dump(autocircuit_data, f, indent=2)
     
     print(f"Saved AutoCircuit dataset with {len(autocircuit_data['prompts'])} prompt pairs to {path}")
+    if duplicate_count > 0:
+        print(f"Removed {duplicate_count} duplicate prompt pairs")
 
 
 def create_contrastive_pairs(df: pd.DataFrame, 
@@ -343,6 +373,11 @@ if __name__ == "__main__":
             raise FileNotFoundError(f"Could not find memorization scores file at {mem_scores_file}")
 
     df = pd.read_json(mem_scores_file)
+
+    len_before = len(df)    
+    df = df.drop_duplicates(subset=['decoded_context','decoded_completion','decoded_true_completion'])
+    len_after = len(df)
+    print(f"Removed {len_before - len_after} duplicate examples")
 
     # Output path for contrastive dataset
     path = Path(f"{output_dir}/contrastive_{short_dataset}_{threshold}_{short_model_name}_{prompt_tokens}_{generation_tokens}_{metric}_{contrastive_mode}.json")
