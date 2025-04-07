@@ -1,5 +1,5 @@
 from functools import partial
-from typing import Callable
+from typing import Callable, Literal
 import argparse
 import pandas as pd
 import torch
@@ -27,12 +27,12 @@ def collate_EAP(xs):
 class EAPDataset(Dataset):
     def __init__(self, filepath:Path, tokenizer: PreTrainedTokenizer):
         self.tokenizer = tokenizer        
+        self._mode = "noising"
         with open(filepath, 'r') as f:
             data = json.load(f)
         prompts = data['prompts']
         self.df = pd.DataFrame(prompts)
-        # Rename 'corrupt' column to 'corrupted' to match downstream expectations
-        self.df.rename(columns={'corrupt': 'corrupted'}, inplace=True)
+        # Rename 'corrupt' column to 'corrupted' to match downstream expectations        
         # Extract first correct and incorrect answer strings
         self.df['correct_answer'] = self.df['answers'].apply(lambda x: x[0] if x else None)
         self.df['incorrect_answer'] = self.df['wrong_answers'].apply(lambda x: x[0] if x else None)
@@ -41,7 +41,6 @@ class EAPDataset(Dataset):
         if 'label' in self.df.columns:
             self.df.drop(columns=['label'], inplace=True)
 
-        # --- Pre-tokenize answers --- 
         correct_answers = self.df['correct_answer'].tolist()
         incorrect_answers = self.df['incorrect_answer'].tolist()
 
@@ -57,8 +56,15 @@ class EAPDataset(Dataset):
                                             for ids in incorrect_tokenized['input_ids']]
         
         # Drop intermediate string columns
-        self.df.drop(columns=['correct_answer', 'incorrect_answer'], inplace=True)
-            # --- End Pre-tokenization ---
+        self.df.drop(columns=['correct_answer', 'incorrect_answer'], inplace=True)            
+
+    @property
+    def mode(self):
+        return self._mode
+    
+    @mode.setter
+    def mode(self, value:Literal["noising", "denoising"]):
+        self._mode = value
 
     def __len__(self):
         return len(self.df)
@@ -72,9 +78,12 @@ class EAPDataset(Dataset):
     def __getitem__(self, index):
         row = self.df.iloc[index]
         # Return clean, corrupted, and the tuple of token IDs
-        return row['clean'], row['corrupted'], (row['correct_token_id'], row['incorrect_token_id'])
+        if self.mode == "noising":
+            return row['clean'], row['corrupt'], (row['correct_token_id'], row['incorrect_token_id'])
+        else:
+            return row['corrupt'], row['clean'], (row['correct_token_id'], row['incorrect_token_id'])
     
-    def to_dataloader(self, batch_size: int, test_size: float = 0.1, seed: int = 42): # No tokenizer needed here
+    def to_dataloader(self, batch_size: int, test_size: float = 0.1, seed: int = 42, mode: Literal["noising", "denoising"] = "noising"): # No tokenizer needed here
         """Splits the dataset into train and test sets and returns corresponding dataloaders."""
         dataset_size = len(self)
         test_split_size = int(test_size * dataset_size)
@@ -85,6 +94,9 @@ class EAPDataset(Dataset):
         train_dataset, test_dataset = random_split(
             self, [train_split_size, test_split_size], generator=generator
         )
+
+        # set only for the test dataset
+        test_dataset.mode = mode
 
         # Pass the simplified collate_EAP directly
         train_loader = DataLoader(train_dataset, batch_size=batch_size, collate_fn=collate_EAP)
@@ -154,6 +166,7 @@ if __name__ == "__main__":
     parser.add_argument("--batch_size", type=int, default=64, help="Batch size for processing")    
     parser.add_argument("--model_name", type=str, default="EleutherAI/gpt-neo-125m", help="Model to use")
     parser.add_argument("--path", type=str, default="data/results/contrastive_mem_0.5_gpt-neo-125m_50_50_bleu_filtered100.json", help="Path to the contrastive dataset")
+    parser.add_argument("--mode", type=str, default="noising", choices=["noising", "denoising"], help="Noising: corrupt -> clean, Denoising: clean -> corrupt")
     parser.add_argument("--output_dir", type=str, default="data/circuits", help="Directory to save circuit results")
     
     args = parser.parse_args()
@@ -173,7 +186,7 @@ if __name__ == "__main__":
 
     ds = EAPDataset(path, model.tokenizer) 
     # Create train and test dataloaders
-    train_dataloader, test_dataloader = ds.to_dataloader(batch_size=batch_size, test_size=0.1, seed=42) 
+    train_dataloader, test_dataloader = ds.to_dataloader(batch_size=batch_size, test_size=0.1, seed=42, mode=args.mode) 
 
 
     # Evaluate baseline on the test data
@@ -199,8 +212,8 @@ if __name__ == "__main__":
     print("Number of included nodes:", g.count_included_nodes())
     
     # Generate filenames with dataset info
-    circuit_json = output_dir / f'graph-{path.stem}.json'
-    circuit_viz = output_dir / f'graph-{path.stem}.png'
+    circuit_json = output_dir / f'graph-{args.mode}-{path.stem}.json'
+    circuit_viz = output_dir / f'graph-{args.mode}-{path.stem}.png'
     
     # Save circuit
     g.to_json(str(circuit_json))
