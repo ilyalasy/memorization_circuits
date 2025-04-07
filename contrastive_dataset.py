@@ -41,8 +41,8 @@ def convert_to_sequences(context_tensor:t.Tensor,
         minimal_context.append(min_context)
 
         # take the next 2 tokens: first one will serve as clean/corrupted prompt, second one will be the correct/wrong answer
-        next_gt_tokens.append(whole_samples[i, min_len:min_len+2].tolist())
-        next_generated_tokens.append(generated_outputs[min_len][i, min_len:min_len+2].tolist()) 
+        next_gt_tokens.append(whole_samples[i, min_len:].tolist())
+        next_generated_tokens.append(generated_outputs[min_len][i, min_len:].tolist()) 
     
     return {
         'minimal_context': minimal_context,
