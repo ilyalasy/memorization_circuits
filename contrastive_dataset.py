@@ -295,6 +295,7 @@ def create_contrastive_pairs(df: pd.DataFrame,
     
     # For each high memorization example, find the most similar unused low memorization example
     for i in tqdm(range(min(len(high_mem_df), max_pairs))):
+        
         # Calculate cosine similarity between current high embedding and all low embeddings
         similarities = t.nn.functional.cosine_similarity(high_embeddings[i].unsqueeze(0), low_embeddings).cpu()
         
@@ -310,6 +311,10 @@ def create_contrastive_pairs(df: pd.DataFrame,
         most_similar_idx = t.argmax(similarities_masked).item()
         similarity_score = similarities[most_similar_idx]
         
+        if len(tokenizer(high_mem_df.iloc[i]['decoded_context'])["input_ids"]) != len(tokenizer(low_mem_df.iloc[most_similar_idx]['decoded_context'])["input_ids"]):
+            print(f"Skipping pair {i} because of length mismatch after decoding")
+            continue
+
         # Mark this low example as used
         available_mask[most_similar_idx] = 0
         
