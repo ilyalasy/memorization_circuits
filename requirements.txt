@@ -2,7 +2,7 @@ torch>=2.5.0
 transformers>=4.45.2
 transformer_lens>=2.8.0
 matplotlib>=3.9.2
-auto_circuit>=0.1.0
+auto_circuit @ git+https://github.com/ilyalasy/auto-circuit.git@tokenization
 pandas>=2.2.3
 eap @ git+https://github.com/ilyalasy/EAP-IG.git
 sentence-transformers>=4.0.0
