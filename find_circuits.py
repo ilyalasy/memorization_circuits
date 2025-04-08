@@ -55,9 +55,9 @@ def find_minimal_circuit(model: PatchableModel, test_loader: PromptDataLoader, p
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Find minimal circuits in transformer models")
-    parser.add_argument("--batch_size", type=int, default=8, help="Batch size for processing")    
-    parser.add_argument("--model_name", type=str, default="EleutherAI/pythia-70m-deduped", help="Model to use")
-    parser.add_argument("--path", type=str, default="data/results/contrastive_mem_0.5_pythia-70m-deduped_bleu_ac.json", help="Path to the contrastive dataset")
+    parser.add_argument("--batch_size", type=int, default=4, help="Batch size for processing")    
+    parser.add_argument("--model_name", type=str, default="EleutherAI/gpt-neo-125m", help="Model to use")
+    parser.add_argument("--path", type=str, default="data/results/contrastive_pile-wikipedia_en_0.75_gpt-neo-125m_50_50_bleu_divergence_ac_full.json", help="Path to the contrastive dataset")
     parser.add_argument("--output_dir", type=str, default="data/circuits", help="Directory to save circuit results")
     parser.add_argument("--ig", type=int, default=5, help="Number of integrated gradient steps")
     parser.add_argument("--ablation_type", type=str, default="RESAMPLE", choices=["RESAMPLE", "MEAN", "ZERO"], help="Type of ablation")
@@ -84,13 +84,16 @@ if __name__ == "__main__":
     
     # Load and prepare the model
     model = load_tl_model(args.model_name, device)
+
+    slice_output = (slice(None),slice(50,100))
     model = patchable_model(
         model,
         factorized=True,
-        slice_output="last_seq",
+        slice_output=slice_output,
         separate_qkv=True,
         device=device,
-        ignore_tokens=[]
+        ignore_tokens=[],
+        # seq_len=50
     )
     
     # Create train and test dataloaders
@@ -99,7 +102,7 @@ if __name__ == "__main__":
         return_seq_length=False, 
         tail_divergence=False, 
         train_test_size=(train_size, test_size), 
-        batch_size=args.batch_size
+        batch_size=args.batch_size,        
     )
     
     # Path for storing/loading prune scores
@@ -122,8 +125,8 @@ if __name__ == "__main__":
             model=model,
             dataloader=train_loader,
             official_edges=None,
-            grad_function="logit",
-            answer_function="avg_diff",
+            grad_function="logprob",
+            answer_function="avg_val",
             mask_val=mask_val, 
             integrated_grad_samples=args.ig,
             ablation_type=ablation_type
