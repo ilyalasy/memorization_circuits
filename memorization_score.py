@@ -11,6 +11,7 @@ import pandas as pd
 import multiprocessing as mp
 from functools import partial
 import os
+from torch.utils.data import DataLoader
 # logging.get_logger("transformers").setLevel(logging.ERROR)
 device = torch.device("cuda" if torch.cuda.is_available() else "mps")
 
@@ -40,9 +41,9 @@ def find_optimal_batch_size(model:AutoModelForCausalLM, tokenizer:AutoTokenizer,
     optimal = low
     
     # Get a sample batch for testing
-    sample_data = next(iter(dataset.batch(batch_size=high)))
+    sample_data = dataset.take(high) #next(iter())
 
-    print(sample_data["input_ids"].shape)
+    print(len(sample_data["input_ids"]))
     
     while low <= high:
         mid = (low + high) // 2
@@ -54,8 +55,8 @@ def find_optimal_batch_size(model:AutoModelForCausalLM, tokenizer:AutoTokenizer,
             torch.cuda.reset_peak_memory_stats()
             torch.cuda.empty_cache()                        
                         
-            tokens = torch.from_numpy(sample_data["input_ids"]).to(device)
-            context = tokens[:, :prompt_tokens]                    
+            tokens = torch.tensor(sample_data["input_ids"])
+            context = tokens[:mid, :prompt_tokens].to(device)
             
             # Test generation with this batch size
             print(f"  Running generation with batch size {mid}...")
@@ -84,6 +85,7 @@ def find_optimal_batch_size(model:AutoModelForCausalLM, tokenizer:AutoTokenizer,
                 print(f"  Peak CUDA memory before OOM: {peak_mem:.2f} GB")
             high = mid - 1
             torch.cuda.empty_cache()  # Clear GPU memory after OOM
+        sample_data = dataset.take(high) #next(iter())
     
     # Get final GPU stats
     total_gpu_memory = torch.cuda.get_device_properties(0).total_memory / (1024 ** 3)
@@ -116,11 +118,14 @@ def calculate_memorization_score(model:AutoModelForCausalLM, tokenizer:AutoToken
     model = model.to(device).half()
     model.eval()
     
+    def collate_fn(batch):        
+        return torch.tensor([x["input_ids"] for x in batch])
+
     # Process dataset in batches
-    batches = dataset.batch(batch_size=batch_size)
+    dataloader = DataLoader(dataset, batch_size=batch_size, shuffle=False, num_workers=16,collate_fn=collate_fn)
         
-    for batch in tqdm(batches, desc="Processing dataset..."):
-        tokens = batch["input_ids"].to(device)
+    for batch in tqdm(dataloader, desc="Processing dataset..."):
+        tokens = batch.to(device)
             
         context = tokens[:, :prompt_tokens]
         true_completion = tokens[:, prompt_tokens:prompt_tokens + generation_tokens]
@@ -204,7 +209,7 @@ def main():
                         help="Number of tokens to use as prompt")
     parser.add_argument("--generation_tokens", type=int, default=50, 
                         help="Number of tokens to generate")
-    parser.add_argument("--batch_size", type=int, default=0, 
+    parser.add_argument("--batch_size", type=int, default=4096, 
                         help="Batch size for processing (0 for auto-detect)")
     parser.add_argument("--dataset", type=str, default="/share/datasets/the-pile/wikipedia/shards", 
                         help="Dataset to use for evaluation")
@@ -267,6 +272,10 @@ def main():
         job_id = 0
         num_jobs = 1
         path = output_dir / f"mem_scores_{dataset_short_name}_{model_short_name}_{prompt_tokens}_{generation_tokens}.json"
+
+    tokenizer = AutoTokenizer.from_pretrained(model_name)
+    tokenizer.pad_token_id = tokenizer.eos_token_id
+    tokenizer.padding_side = 'right'        
     
     if path.exists():
         results_df = pd.read_json(path, orient='records')
@@ -284,7 +293,8 @@ def main():
 
             dataset = load_dataset("json",data_files=jsonl_files, split="train") #streaming=True
 
-            dataset = dataset.shard(num_shards=num_jobs, index=job_id, contiguous=True)            
+
+            dataset = dataset.shard(num_shards=num_jobs, index=job_id, contiguous=True)
             dataset_len = dataset.num_rows
         else:
             # Load from HuggingFace Hub
@@ -292,14 +302,8 @@ def main():
             dataset_len = len(dataset)
         print(f"Dataset length: {dataset_len}")
 
-        tokenizer = AutoTokenizer.from_pretrained(model_name)
-        tokenizer.pad_token_id = tokenizer.eos_token_id
-        tokenizer.padding_side = 'right'
 
-        # Use the number of available CPU cores for parallel processing
-        num_cores = mp.cpu_count() 
-        print(f"Using {num_cores} cores for tokenization") #num_proc=num_cores
-        dataset = dataset.map(partial(tokenize_batch, tokenizer=tokenizer), batched=True, batch_size=1000, num_proc=num_cores) #cache_file_name=f"{dataset_name}/{dataset_short_name}_{model_short_name}_{prompt_tokens}_{generation_tokens}.cache"
+        dataset = dataset.map(partial(tokenize_batch, tokenizer=tokenizer), batched=True, batch_size=1000, num_proc=32,cache_file_name=f"{dataset_name}/{dataset_short_name}_{model_short_name}_{prompt_tokens}_{generation_tokens}_job{job_id}.cache")
         
         job_desc = f" (Job {job_id+1}/{num_jobs})" if job_id is not None else ""
         print(f"Calculating memorization score{job_desc} (prompt: {prompt_tokens} tokens, generate: {generation_tokens} tokens)")        
