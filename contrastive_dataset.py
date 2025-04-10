@@ -9,6 +9,49 @@ from collections import defaultdict
 from pandarallel import pandarallel
 import json
 import os
+import logging
+
+# Custom logger that prepends job ID to all messages
+class JobLogger:
+    _instances = {}  # Class variable to track instances by name
+    
+    def __init__(self, job_id=None):
+        self.job_id = job_id
+        self.logger = logging.getLogger("contrastive_dataset")
+        
+        # Clear any existing handlers to prevent duplication
+        if self.logger.handlers:
+            self.logger.handlers = []
+            
+        # Add a single handler
+        handler = logging.StreamHandler()
+        formatter = logging.Formatter('%(message)s')
+        handler.setFormatter(formatter)
+        self.logger.addHandler(handler)
+        self.logger.setLevel(logging.INFO)
+        self.logger.propagate = False
+
+    def info(self, msg, *args, **kwargs):
+        prefix = f"[Job {self.job_id}] " if self.job_id is not None else ""
+        self.logger.info(f"{prefix}{msg}", *args, **kwargs)
+
+    def warning(self, msg, *args, **kwargs):
+        prefix = f"[Job {self.job_id}] " if self.job_id is not None else ""
+        self.logger.warning(f"{prefix}{msg}", *args, **kwargs)
+
+    def error(self, msg, *args, **kwargs):
+        prefix = f"[Job {self.job_id}] " if self.job_id is not None else ""
+        self.logger.error(f"{prefix}{msg}", *args, **kwargs)
+        
+    @classmethod
+    def get_logger(cls, job_id=None):
+        """Get or create a logger with the specified job_id"""
+        if job_id not in cls._instances:
+            cls._instances[job_id] = cls(job_id)
+        return cls._instances[job_id]
+
+# Initialize logger with None job_id, will be updated later
+logger = JobLogger.get_logger()
 
 from metrics.nmt_bleu import compute_bleu
 from typing import Literal
@@ -158,7 +201,7 @@ def find_minimum_context_for_memorization(model: AutoModelForCausalLM,
 def save_jsonl(all_sequences:dict,path:Path,tokenizer:AutoTokenizer):
     total_skipped_count = 0
     total_len = len(all_sequences['minimal_context'])
-    print(f"Saving decoded data to {path}")        
+    logger.info(f"Saving decoded data to {path}")        
     with open(path, 'w') as f:
         for i in range(total_len):
             # Filter those that cannot create clean/corrupt pair
@@ -177,7 +220,7 @@ def save_jsonl(all_sequences:dict,path:Path,tokenizer:AutoTokenizer):
             
             # Write as JSON line
             f.write(json.dumps(sample) + '\n')
-    print(f"Total skipped count: {total_skipped_count}/{total_len}")
+    logger.info(f"Total skipped count: {total_skipped_count}/{total_len}")
 
 def save_autocircuit_ds(all_sequences:dict, path:Path, tokenizer:AutoTokenizer):
     """
@@ -213,7 +256,7 @@ def save_autocircuit_ds(all_sequences:dict, path:Path, tokenizer:AutoTokenizer):
         wrong_answer = tokenizer.decode(all_sequences['next_generated_tokens'][i][1])
 
         if len(tokenizer(clean_text)["input_ids"]) != len(tokenizer(corrupt_text)["input_ids"]):
-            print(f"Skipping pair {i} because of length mismatch after decoding")
+            logger.info(f"Skipping pair {i} because of length mismatch after decoding")
             continue
         
         # Create a unique identifier for this prompt pair
@@ -241,9 +284,9 @@ def save_autocircuit_ds(all_sequences:dict, path:Path, tokenizer:AutoTokenizer):
     with open(path, 'w') as f:
         json.dump(autocircuit_data, f, indent=2)
     
-    print(f"Saved AutoCircuit dataset with {len(autocircuit_data['prompts'])} prompt pairs to {path}")
+    logger.info(f"Saved AutoCircuit dataset with {len(autocircuit_data['prompts'])} prompt pairs to {path}")
     if duplicate_count > 0:
-        print(f"Removed {duplicate_count} duplicate prompt pairs")
+        logger.info(f"Removed {duplicate_count} duplicate prompt pairs")
 
 
 def check_matching_token(low_row:pd.Series, div_pos:int, target_token:int):
@@ -308,11 +351,11 @@ def create_contrastive_pairs(df: pd.DataFrame,
     high_mem_df = df[df['memorization_score'] >= high_threshold].reset_index()
     low_mem_df = df[df['memorization_score'] <= low_threshold].reset_index()
     
-    print(f"High memorization examples: {len(high_mem_df)}")
-    print(f"Low memorization examples: {len(low_mem_df)}")
+    logger.info(f"High memorization examples: {len(high_mem_df)}")
+    logger.info(f"Low memorization examples: {len(low_mem_df)}")
     
     if len(high_mem_df) == 0 or len(low_mem_df) == 0:
-        print("Not enough examples in one of the groups.")
+        logger.info("Not enough examples in one of the groups.")
         return []
     
     # Check if diverging_position column exists
@@ -323,7 +366,7 @@ def create_contrastive_pairs(df: pd.DataFrame,
         high_mem_df = high_mem_df.dropna(subset=['diverging_position'])
         len_after = len(high_mem_df)
         if len_before != len_after:
-            print(f"Removed {len_before - len_after} examples with no diverging position")
+            logger.info(f"Removed {len_before - len_after} examples with no diverging position")
     
     # Function to calculate token overlap similarity between two texts
     def calculate_token_overlap(tokens1, tokens2):                
@@ -340,7 +383,7 @@ def create_contrastive_pairs(df: pd.DataFrame,
         return overlap_ratio
     
     # Process high memorization examples - cut contexts to diverging_position if available
-    print("Generating embeddings for high memorization examples...")
+    logger.info("Generating embeddings for high memorization examples...")
     high_mem_df['processed_context'], high_mem_df['processed_context_decoded'] = zip(*high_mem_df.apply(partial(cut_up_to_pos, tokenizer=tokenizer), axis=1))
     
     # Only generate embeddings if using embedding similarity
@@ -349,7 +392,7 @@ def create_contrastive_pairs(df: pd.DataFrame,
         high_embeddings = get_model_embeddings(high_mem_df['processed_context_decoded'].tolist(), tokenizer=tokenizer, model=model, batch_size=batch_size)
     
     # Find most similar pairs
-    print("Finding most similar pairs...")
+    logger.info("Finding most similar pairs...")
     contrastive_pairs = []
     
     # Process each high memorization example
@@ -369,7 +412,7 @@ def create_contrastive_pairs(df: pd.DataFrame,
                 
                 # If no matching examples found, skip this high example
                 if matching_low_df.empty:
-                    print(f"No matching low examples found for high example {i}")
+                    logger.info(f"No matching low examples found for high example {i}")
                     continue
                 
                 matching_low_df['processed_context'], matching_low_df['processed_context_decoded'] = zip(*matching_low_df.parallel_apply(partial(cut_up_to_pos, tokenizer=tokenizer, div_pos=div_pos), axis=1))
@@ -424,10 +467,10 @@ def create_contrastive_pairs(df: pd.DataFrame,
                         break
                 
                 if not found_valid_match:
-                    print(f"No valid match found for high example {i} where model predicts the target token")
+                    logger.info(f"No valid match found for high example {i} where model predicts the target token")
                     continue
             else:
-                print(f"Skipping high example {i}: diverging position is at the end of context")
+                logger.info(f"Skipping high example {i}: diverging position is at the end of context")
                 continue
         else:
             # Fall back to original behavior if no diverging_position
@@ -450,7 +493,7 @@ def create_contrastive_pairs(df: pd.DataFrame,
             similarity_score = similarities[most_similar_idx].item()
             
             if len(tokenizer(high_row['processed_context'])['input_ids']) != len(tokenizer(low_mem_df.iloc[most_similar_idx]['decoded_context'])['input_ids']):
-                print(f"Skipping pair {i} because of length mismatch after decoding")
+                logger.info(f"Skipping pair {i} because of length mismatch after decoding")
                 continue
             
             # Create contrastive pair
@@ -467,7 +510,7 @@ def create_contrastive_pairs(df: pd.DataFrame,
     # Sort by similarity score
     contrastive_pairs.sort(key=lambda x: x['similarity_score'], reverse=True)
     
-    print(f"Created {len(contrastive_pairs)} contrastive pairs")
+    logger.info(f"Created {len(contrastive_pairs)} contrastive pairs")
     return {'prompts': contrastive_pairs}
 
 def merge_results(output_dir, dataset_name, model_name, prompt_tokens, generation_tokens, num_jobs, threshold, metric, contrastive_mode):
@@ -485,12 +528,12 @@ def merge_results(output_dir, dataset_name, model_name, prompt_tokens, generatio
             with open(job_path, 'r') as f:
                 job_results = json.load(f)
             all_results.extend(job_results["prompts"])
-            print(f"Loaded job result from {job_path} ({len(job_results['prompts'])} samples)")
+            logger.info(f"Loaded job result from {job_path} ({len(job_results['prompts'])} samples)")
         else:
-            print(f"Warning: Missing results file for job {job_id}: {job_path}")
+            logger.warning(f"Warning: Missing results file for job {job_id}: {job_path}")
     
     if not all_results:
-        print("No results found to merge!") 
+        logger.warning("No results found to merge!") 
         return None
     
     # Combine all results
@@ -500,7 +543,7 @@ def merge_results(output_dir, dataset_name, model_name, prompt_tokens, generatio
     merged_path = Path(f"{output_dir}/contrastive_{dataset_short_name}_{threshold}_{model_short_name}_{prompt_tokens}_{generation_tokens}_{metric}_{contrastive_mode}.json")
     with open(merged_path, 'w') as f:
         json.dump(merged_results, f, indent=2)
-    print(f"Saved merged results to {merged_path} ({len(merged_results['prompts'])} total samples)")
+    logger.info(f"Saved merged results to {merged_path} ({len(merged_results['prompts'])} total samples)")
     
     # Merge JSONL files if in divergence mode
     if contrastive_mode == "divergence":
@@ -523,9 +566,9 @@ def merge_results(output_dir, dataset_name, model_name, prompt_tokens, generatio
                         for line in lines:
                             outfile.write(line)
                 else:
-                    print(f"Warning: Missing JSONL file for job {job_id}: {jsonl_path}")
+                    logger.warning(f"Warning: Missing JSONL file for job {job_id}: {jsonl_path}")
             
-            print(f"Saved merged JSONL results to {merged_jsonl_path} ({merged_count} total samples)")
+            logger.info(f"Saved merged JSONL results to {merged_jsonl_path} ({merged_count} total samples)")
     
     return merged_results
 
@@ -566,19 +609,44 @@ if __name__ == "__main__":
     num_jobs = args.num_jobs
     merge_only = args.merge_only
     
+    # Update logger with job ID
+    logger = JobLogger.get_logger(job_id)
+    
     # For Slurm array jobs, we can also get job_id from environment variable
-    if job_id is None and "SLURM_ARRAY_TASK_ID" in os.environ:
-        job_id = int(os.environ["SLURM_ARRAY_TASK_ID"])
-        print(f"Using SLURM_ARRAY_TASK_ID={job_id}")
+    if job_id is None:
+        # Handle both array and non-array job modes
+        if "SLURM_ARRAY_TASK_ID" in os.environ and "SLURM_ARRAY_TASK_COUNT" in os.environ:
+            # Array job mode
+            logger.info("Running in array job mode")
+            array_task_id = int(os.environ["SLURM_ARRAY_TASK_ID"])
+            array_task_count = int(os.environ["SLURM_ARRAY_TASK_COUNT"])
+            ntasks = int(os.environ.get("SLURM_NTASKS", 1))
+            procid = int(os.environ.get("SLURM_PROCID", 0))
+            job_id = array_task_id * ntasks + procid
+            num_jobs = array_task_count * ntasks
+            logger.info(f"Using SLURM_ARRAY_TASK_ID={array_task_id}, SLURM_NTASKS={ntasks}, SLURM_PROCID={procid}, job_id={job_id}")
+        elif "SLURM_PROCID" in os.environ and "SLURM_NTASKS" in os.environ:
+            # Single job with tasks mode
+            logger.info("Running in single job mode with multiple tasks")
+            procid = int(os.environ["SLURM_PROCID"])
+            ntasks = int(os.environ["SLURM_NTASKS"])
+            job_id = procid
+            num_jobs = ntasks
+            logger.info(f"Using SLURM_PROCID={procid}, SLURM_NTASKS={ntasks}")
+        
+        # Update logger with new job ID
+        logger = JobLogger.get_logger(job_id)
     
     if num_jobs is None and "SLURM_ARRAY_TASK_COUNT" in os.environ:
         num_jobs = int(os.environ["SLURM_ARRAY_TASK_COUNT"])
-        print(f"Using SLURM_ARRAY_TASK_COUNT={num_jobs}")
+        logger.info(f"Using SLURM_ARRAY_TASK_COUNT={num_jobs}")
     
+    logger.info(f"Job ID: {job_id}, Number of jobs: {num_jobs}")
+
     # If only merging results
     if merge_only:
         if num_jobs is None:
-            print("Error: --num_jobs must be specified when using --merge_only")
+            logger.error("Error: --num_jobs must be specified when using --merge_only")
             exit(1)
         
         merge_results(output_dir, dataset, model_name, prompt_tokens, generation_tokens, num_jobs, threshold, metric, contrastive_mode)
@@ -608,7 +676,7 @@ if __name__ == "__main__":
     # if output_path.exists():
     #     with open(output_path, 'r') as f:
     #         all_sequences = json.load(f)["prompts"]
-    #     print(f"Loaded {len(all_sequences)} contrastive pairs from {output_path}")
+    #     logger.info(f"Loaded {len(all_sequences)} contrastive pairs from {output_path}")
     #     exit(0)
 
     if mem_scores_file.suffix == ".parquet":
@@ -625,14 +693,14 @@ if __name__ == "__main__":
     rows_per_job = total_rows // num_jobs
     start_row = job_id * rows_per_job
     end_row = start_row + rows_per_job if job_id < num_jobs - 1 else total_rows    
-    print(f"Job {job_id}/{num_jobs}: Processing rows {start_row} to {end_row} out of {total_rows}")
+    logger.info(f"Job {job_id}/{num_jobs}: Processing rows {start_row} to {end_row} out of {total_rows}")
     df = df.iloc[start_row:end_row]
 
     len_before = len(df)
     df = df.drop_duplicates(subset=['decoded_context','decoded_completion','decoded_true_completion'])
     len_after = len(df)
     if len_before != len_after:
-        print(f"Removed {len_before - len_after} duplicate examples")
+        logger.info(f"Removed {len_before - len_after} duplicate examples")
 
     tokenizer = AutoTokenizer.from_pretrained(model_name)
     tokenizer.pad_token_id = tokenizer.eos_token_id
@@ -662,7 +730,7 @@ if __name__ == "__main__":
         # Check if the output from divergence mode exists and load it if it does
         divergence_output_path = Path(f"{output_dir}/contrastive_{short_dataset}_{threshold}_{short_model_name}_{prompt_tokens}_{generation_tokens}_{metric}_divergence.jsonl")
         if divergence_output_path.exists():
-            print(f"Found existing divergence output at {divergence_output_path}, loading...")
+            logger.info(f"Found existing divergence output at {divergence_output_path}, loading...")
             divergence_df = pd.read_json(divergence_output_path, lines=True)
             divergence_df = divergence_df[divergence_df["score_before"] >= 0.75]
             def get_full_context(row:pd.Series):
@@ -678,10 +746,11 @@ if __name__ == "__main__":
                 model=model,
                 high_threshold=threshold,
                 low_threshold=0.0,                
-                batch_size=batch_size
+                batch_size=batch_size,
+                sim_metric="token_overlap"
             )
         # Save the dataset for this job
         with open(output_path, 'w') as f:
             json.dump(contrastive_pairs, f, indent=2)
         
-        print(f"Saved AutoCircuit dataset with {len(contrastive_pairs['prompts'])} prompt pairs to {output_path}")
+        logger.info(f"Saved AutoCircuit dataset with {len(contrastive_pairs['prompts'])} prompt pairs to {output_path}")
