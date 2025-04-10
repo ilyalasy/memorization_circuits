@@ -6,7 +6,7 @@ from transformers import AutoTokenizer,AutoModelForCausalLM
 from tqdm.auto import tqdm
 import numpy as np
 from collections import defaultdict
-# from pandarallel import pandarallel
+from pandarallel import pandarallel
 import json
 import os
 
@@ -18,8 +18,9 @@ import torch as t
 from sentence_transformers import SentenceTransformer
 import numpy as np
 from tqdm import tqdm
+from functools import partial
 
-# pandarallel.initialize(nb_workers=16,progress_bar=True)
+pandarallel.initialize(nb_workers=8,progress_bar=True)
 
 device = t.device("cuda" if t.cuda.is_available() else "mps")
 
@@ -245,8 +246,42 @@ def save_autocircuit_ds(all_sequences:dict, path:Path, tokenizer:AutoTokenizer):
         print(f"Removed {duplicate_count} duplicate prompt pairs")
 
 
+def check_matching_token(low_row:pd.Series, div_pos:int, target_token:int):
+    low_context_tokens = low_row["context"]
+    # Check if low example has enough tokens and matching token at div_pos
+    if div_pos < len(low_context_tokens) and low_context_tokens[div_pos] == target_token:
+        return True
+    return False
+
+def cut_up_to_pos(row:pd.Series, tokenizer:AutoTokenizer,div_pos:int|None=None):
+    if div_pos is None:
+        div_pos = int(row['diverging_position']) if not pd.isna(row.get('diverging_position')) else None
+
+    if div_pos is None:
+        return row['decoded_context']
+    
+    return tokenizer.decode(row["context"][:div_pos])
+
+# Function to get model embeddings through mean pooling of last layer
+def get_model_embeddings(texts:list[str], tokenizer:AutoTokenizer, model:AutoModelForCausalLM, device=device):
+    embeddings = []
+    with t.no_grad():
+        for i in tqdm(range(0, len(texts), batch_size),total=len(texts)//batch_size, desc="Generating embeddings"):
+            batch_texts = texts[i:i+batch_size]
+            encoded = tokenizer(batch_texts, return_tensors="pt", padding=True, truncation=True).to(device)
+            outputs = model(**encoded, output_hidden_states=True)
+            # Get last hidden state and mean pool across sequence length
+            last_hidden_state = outputs.hidden_states[-1]
+            # Create attention mask that ignores padding tokens
+            attention_mask = encoded.attention_mask.unsqueeze(-1)
+            # Mean pooling
+            mean_pooled = t.sum(last_hidden_state * attention_mask, 1) / t.sum(attention_mask, 1)
+            embeddings.append(mean_pooled.cpu())
+    return t.cat(embeddings, dim=0)
+
 def create_contrastive_pairs(df: pd.DataFrame, 
                              tokenizer: AutoTokenizer,
+                             model: AutoModelForCausalLM,
                              high_threshold: float = 0.75, 
                              low_threshold: float = 0.0, 
                              max_pairs: int = 1000, batch_size=32) -> list:
@@ -257,6 +292,7 @@ def create_contrastive_pairs(df: pd.DataFrame,
     Args:
         df: DataFrame with memorization data
         tokenizer: Tokenizer to use for encoding/decoding
+        model: The language model to use for embeddings and predictions
         high_threshold: Minimum memorization score for "clean" examples
         low_threshold: Maximum memorization score for "corrupt" examples
         max_pairs: Maximum number of pairs to create
@@ -277,61 +313,114 @@ def create_contrastive_pairs(df: pd.DataFrame,
         print("Not enough examples in one of the groups.")
         return []
     
-    # Load sentence transformer model for semantic similarity calculation
-    print("Loading sentence embedding model...")
-    model = SentenceTransformer('all-MiniLM-L6-v2') #all-mpnet-base-v2
+    # Check if diverging_position column exists
+    has_diverging_position = 'diverging_position' in df.columns        
     
-    # Create embeddings for contexts
+    # Process high memorization examples - cut contexts to diverging_position if available
     print("Generating embeddings for high memorization examples...")
-    high_contexts = high_mem_df['decoded_context'].tolist()
-    high_embeddings = model.encode(high_contexts, show_progress_bar=True, convert_to_tensor=True, batch_size=batch_size)
-    
-    print("Generating embeddings for low memorization examples...")
-    low_contexts = low_mem_df['decoded_context'].tolist()
-    low_embeddings = model.encode(low_contexts, show_progress_bar=True, convert_to_tensor=True, batch_size=batch_size)
+    high_mem_df['processed_context'] = high_mem_df.apply(partial(cut_up_to_pos, tokenizer=tokenizer), axis=1)
+    high_embeddings = get_model_embeddings(high_mem_df['processed_context'].tolist(), tokenizer=tokenizer, model=model)
     
     # Find most similar pairs
     print("Finding most similar pairs...")
     contrastive_pairs = []
     
-    # Keep track of used low memorization examples
-    available_mask = t.ones(len(low_mem_df))
-    
-    # For each high memorization example, find the most similar unused low memorization example
+    # Process each high memorization example
     for i in tqdm(range(min(len(high_mem_df), max_pairs))):
+        high_row = high_mem_df.iloc[i]
         
-        # Calculate cosine similarity between current high embedding and all low embeddings
-        similarities = t.nn.functional.cosine_similarity(high_embeddings[i].unsqueeze(0), low_embeddings).cpu()
-        
-        # Mask out similarities of already used low examples
-        similarities_masked = similarities * available_mask
-        
-        # If all low examples have been used, skip this high example
-        if similarities_masked.sum() == 0:
-            print(f"Warning: All low memorization examples have been used. Created {len(contrastive_pairs)} pairs.")
-            break
-        
-        # Get the index of the most similar available low example
-        most_similar_idx = t.argmax(similarities_masked).item()
-        similarity_score = similarities[most_similar_idx]
-        
-        if len(tokenizer(high_mem_df.iloc[i]['decoded_context'])["input_ids"]) != len(tokenizer(low_mem_df.iloc[most_similar_idx]['decoded_context'])["input_ids"]):
-            print(f"Skipping pair {i} because of length mismatch after decoding")
-            continue
-
-        # Mark this low example as used
-        available_mask[most_similar_idx] = 0
-        
-        # Create contrastive pair
-        pair = {
-            'clean': high_mem_df.iloc[i]['decoded_context'],
-            "corrupt": low_mem_df.iloc[most_similar_idx]['decoded_context'],
-            "answers": [tokenizer.batch_decode(high_mem_df.iloc[i]['completion'])[0]],
-            "wrong_answers": [tokenizer.batch_decode(low_mem_df.iloc[most_similar_idx]['completion'])[0]],          
-            'similarity_score': float(similarity_score)
-        }
-        
-        contrastive_pairs.append(pair)
+        # Get token at diverging_position + 1 for high memorization example
+        if has_diverging_position and not pd.isna(high_row.get('diverging_position')):
+            div_pos = int(high_row['diverging_position'])
+            high_context_tokens = high_row["context"]
+            
+            if div_pos < len(high_context_tokens) - 1:
+                target_token = high_context_tokens[div_pos]                                            
+                
+                matching_mask = low_mem_df.parallel_apply(partial(check_matching_token, div_pos=div_pos, target_token=target_token), axis=1)
+                matching_low_df = low_mem_df[matching_mask].copy()
+                
+                # If no matching examples found, skip this high example
+                if matching_low_df.empty:
+                    print(f"No matching low examples found for high example {i}")
+                    continue
+                
+                matching_low_df['processed_context'] = matching_low_df.parallel_apply(partial(cut_up_to_pos, tokenizer=tokenizer, div_pos=div_pos), axis=1)
+                
+                matching_low_embeddings = get_model_embeddings(matching_low_df['processed_context'].tolist(), tokenizer=tokenizer, model=model)
+                
+                # Calculate similarities only for matching examples
+                similarities = t.nn.functional.cosine_similarity(high_embeddings[i].unsqueeze(0), matching_low_embeddings).cpu()
+                
+                # Sort similarities in descending order to try alternatives if needed
+                similarity_indices = t.argsort(similarities, descending=True)
+                
+                # Try to find a match where the model's next token prediction matches the target token
+                found_valid_match = False
+                for sim_idx in similarity_indices:
+                    idx = sim_idx.item()
+                    best_match_row = matching_low_df.iloc[idx]
+                    similarity_score = similarities[idx].item()
+                    
+                    # Double check that the model's prediction is the target token
+                    with t.no_grad():
+                        inputs = tokenizer(best_match_row['processed_context'], return_tensors="pt").to(device)
+                        outputs = model(**inputs)
+                        logits = outputs.logits[0, -1, :]
+                        predicted_token_id = t.argmax(logits).item()
+                    
+                    if predicted_token_id == target_token:
+                        found_valid_match = True
+                        
+                        # Truncate both contexts to same length (up to diverging position)
+                        high_context_truncated = high_row['processed_context']
+                        low_context_truncated = best_match_row['processed_context']
+                        
+                        # Create contrastive pair
+                        pair = {
+                            'clean': high_context_truncated,
+                            'corrupt': low_context_truncated,
+                            'answers': [high_row['next_generated_tokens'][0]], # argmax
+                            'wrong_answers': [high_row['next_gt_tokens'][0]], # memorization start
+                            'similarity_score': float(similarity_score),
+                            'diverging_position': div_pos
+                        }
+                        
+                        contrastive_pairs.append(pair)
+                        break
+                
+                if not found_valid_match:
+                    print(f"No valid match found for high example {i} where model predicts the target token")
+                    continue
+            else:
+                print(f"Skipping high example {i}: diverging position is at the end of context")
+                continue
+        else:
+            # Fall back to original behavior if no diverging_position
+            low_contexts = low_mem_df['decoded_context'].tolist()
+            low_embeddings = get_model_embeddings(low_contexts)
+            
+            # Calculate cosine similarity between current high embedding and all low embeddings
+            similarities = t.nn.functional.cosine_similarity(high_embeddings[i].unsqueeze(0), low_embeddings).cpu()
+            
+            # Get the index of the most similar low example
+            most_similar_idx = t.argmax(similarities).item()
+            similarity_score = similarities[most_similar_idx].item()
+            
+            if len(tokenizer(high_row['processed_context'])['input_ids']) != len(tokenizer(low_mem_df.iloc[most_similar_idx]['decoded_context'])['input_ids']):
+                print(f"Skipping pair {i} because of length mismatch after decoding")
+                continue
+            
+            # Create contrastive pair
+            pair = {
+                'clean': high_row['processed_context'],
+                'corrupt': low_mem_df.iloc[most_similar_idx]['decoded_context'],
+                'answers': [tokenizer.batch_decode(high_row['completion'])[0]],
+                'wrong_answers': [tokenizer.batch_decode(low_mem_df.iloc[most_similar_idx]['completion'])[0]],
+                'similarity_score': float(similarity_score)
+            }
+            
+            contrastive_pairs.append(pair)
     
     # Sort by similarity score
     contrastive_pairs.sort(key=lambda x: x['similarity_score'], reverse=True)
@@ -403,7 +492,7 @@ if __name__ == "__main__":
     parser.add_argument("--dataset", type=str, default="timaeus/pile-wikipedia_en", help="Dataset to use")
     parser.add_argument("--batch_size", type=int, default=32, help="Batch size for processing")
     parser.add_argument("--threshold", type=float, default=1.00, help="Memorization score threshold")
-    parser.add_argument("--dataset_path", type=str, default="data/results/mem_scores_wikipedia-full_gpt-neo-125m_50_50_filtered100.parquet", help="Override path to dataset")
+    parser.add_argument("--dataset_path", type=str, default="data/results/mem_scores_wikipedia-full_gpt-neo-125m_50_50.parquet", help="Override path to dataset")
     parser.add_argument("--metric", type=str, default="bleu", choices=["memorization", "bleu"], help="Benchmark metric to use: 'memorization' for exact memorization or 'bleu' for approximate memorization")
     parser.add_argument("--model_name", type=str, default="EleutherAI/gpt-neo-125m", help="Model to use")
     parser.add_argument("--prompt_tokens", type=int, default=50, help="Number of tokens to use as prompt")
@@ -474,11 +563,11 @@ if __name__ == "__main__":
     if not mem_scores_file.exists():
         raise FileNotFoundError(f"Could not find memorization scores file at {mem_scores_file}")    
 
-    if output_path.exists():
-        with open(output_path, 'r') as f:
-            all_sequences = json.load(f)["prompts"]
-        print(f"Loaded {len(all_sequences)} contrastive pairs from {output_path}")
-        exit(0)
+    # if output_path.exists():
+    #     with open(output_path, 'r') as f:
+    #         all_sequences = json.load(f)["prompts"]
+    #     print(f"Loaded {len(all_sequences)} contrastive pairs from {output_path}")
+    #     exit(0)
 
     if mem_scores_file.suffix == ".parquet":
         df = pd.read_parquet(mem_scores_file)
@@ -497,18 +586,21 @@ if __name__ == "__main__":
     print(f"Job {job_id}/{num_jobs}: Processing rows {start_row} to {end_row} out of {total_rows}")
     df = df.iloc[start_row:end_row]
 
-    len_before = len(df)
-    df = df.drop_duplicates(subset=['decoded_context','decoded_completion','decoded_true_completion'])
-    len_after = len(df)
-    if len_before != len_after:
-        print(f"Removed {len_before - len_after} duplicate examples")
+    # len_before = len(df)
+    # df = df.drop_duplicates(subset=['decoded_context','decoded_completion','decoded_true_completion'])
+    # len_after = len(df)
+    # if len_before != len_after:
+    #     print(f"Removed {len_before - len_after} duplicate examples")
 
     tokenizer = AutoTokenizer.from_pretrained(model_name)
+    tokenizer.pad_token_id = tokenizer.eos_token_id
+    tokenizer.padding_side = 'right'
+
+    model = AutoModelForCausalLM.from_pretrained(model_name).to(device)
+
     if contrastive_mode == "divergence":
         df = df[df['memorization_score'] >= threshold]
         df = df.sort_values('memorization_score', ascending=False)
-
-        model = AutoModelForCausalLM.from_pretrained(model_name).to(device)
 
         if device.type == "cuda":
             model = model.half()
@@ -525,10 +617,26 @@ if __name__ == "__main__":
         save_jsonl(all_sequences, output_path.with_name(f"{output_path.stem}.jsonl"), tokenizer)
 
     elif contrastive_mode=="dataset":
+        # Check if the output from divergence mode exists and load it if it does
+        divergence_output_path = Path(f"{output_dir}/contrastive_{short_dataset}_{threshold}_{short_model_name}_{prompt_tokens}_{generation_tokens}_{metric}_divergence.jsonl")
+        if divergence_output_path.exists():
+            print(f"Found existing divergence output at {divergence_output_path}, loading...")
+            divergence_df = pd.read_json(divergence_output_path, lines=True)
+            divergence_df = divergence_df[divergence_df["score_before"] >= 0.75]
+            def get_full_context(row:pd.Series):
+                new_tokens_num = prompt_tokens-row["diverging_position"]
+                return row["minimal_context"] + "".join(row["next_gt_tokens"][:new_tokens_num])
+            divergence_df["full_context"] = divergence_df.apply(get_full_context, axis=1)
+            divergence_df = divergence_df[["full_context","diverging_position","next_gt_tokens", "next_generated_tokens"]]
+            df = df.merge(divergence_df, left_on="decoded_context", right_on="full_context", how="left")
+
         contrastive_pairs = create_contrastive_pairs(
                 df=df,
-                high_threshold=threshold,
                 tokenizer=tokenizer,
+                model=model,
+                high_threshold=threshold,
+                low_threshold=0.0,
+                max_pairs=1000,
                 batch_size=batch_size
             )
         # Save the dataset for this job
