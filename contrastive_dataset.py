@@ -8,6 +8,7 @@ import numpy as np
 from collections import defaultdict
 # from pandarallel import pandarallel
 import json
+import os
 
 from metrics.nmt_bleu import compute_bleu
 from typing import Literal
@@ -57,8 +58,8 @@ def find_minimum_context_for_memorization(model: AutoModelForCausalLM,
                                           significant_drop_threshold:float = 0.3, 
                                           benchmark_metric:Literal['bleu','memorization']='bleu'):
     context_len = len(batch["context"].iloc[0])    
-    whole_samples = batch["context"] + batch["true_completion"]
-    whole_samples = t.tensor(whole_samples.to_list()).to(device)
+    whole_samples = np.concatenate((np.array(batch["context"].to_list()),np.array(batch["true_completion"].to_list())),axis=1)
+    whole_samples = t.tensor(whole_samples).to(device)
     context_tensor = t.tensor(batch["context"].to_list()).to(device)
 
     previous_scores = t.ones(len(batch))
@@ -198,6 +199,8 @@ def save_autocircuit_ds(all_sequences:dict, path:Path, tokenizer:AutoTokenizer):
         # Skip pairs where clean and corrupt are identical
         if all_sequences['next_gt_tokens'][i][0] == all_sequences['next_generated_tokens'][i][0]:
             continue
+        if all_sequences['next_gt_tokens'][i][1] == all_sequences['next_generated_tokens'][i][1]:
+            continue
             
         clean_tokens = all_sequences['minimal_context'][i].tolist() + [all_sequences['next_gt_tokens'][i][0]]
         corrupt_tokens = all_sequences['minimal_context'][i].tolist() + [all_sequences['next_generated_tokens'][i][0]]        
@@ -336,12 +339,71 @@ def create_contrastive_pairs(df: pd.DataFrame,
     print(f"Created {len(contrastive_pairs)} contrastive pairs")
     return {'prompts': contrastive_pairs}
 
+def merge_results(output_dir, dataset_name, model_name, prompt_tokens, generation_tokens, num_jobs, threshold, metric, contrastive_mode):
+    """
+    Merge results from multiple jobs into a single file
+    """
+    dataset_short_name = dataset_name.split('/')[-1]
+    model_short_name = model_name.split('/')[-1]
+    
+    all_results = []
+    
+    for job_id in range(num_jobs):
+        job_path = Path(f"{output_dir}/contrastive_{dataset_short_name}_{threshold}_{model_short_name}_{prompt_tokens}_{generation_tokens}_{metric}_{contrastive_mode}_job{job_id}.json")
+        if job_path.exists():
+            with open(job_path, 'r') as f:
+                job_results = json.load(f)
+            all_results.extend(job_results["prompts"])
+            print(f"Loaded job result from {job_path} ({len(job_results['prompts'])} samples)")
+        else:
+            print(f"Warning: Missing results file for job {job_id}: {job_path}")
+    
+    if not all_results:
+        print("No results found to merge!") 
+        return None
+    
+    # Combine all results
+    merged_results = {"prompts": all_results}
+    
+    # Save merged results
+    merged_path = Path(f"{output_dir}/contrastive_{dataset_short_name}_{threshold}_{model_short_name}_{prompt_tokens}_{generation_tokens}_{metric}_{contrastive_mode}.json")
+    with open(merged_path, 'w') as f:
+        json.dump(merged_results, f, indent=2)
+    print(f"Saved merged results to {merged_path} ({len(merged_results['prompts'])} total samples)")
+    
+    # Merge JSONL files if in divergence mode
+    if contrastive_mode == "divergence":
+        # Create output path for merged JSONL
+        merged_jsonl_path = merged_path.with_name(f"{merged_path.stem}.jsonl")
+        
+        # Open output file
+        with open(merged_jsonl_path, 'w') as outfile:
+            merged_count = 0
+            
+            # Read and merge all JSONL files
+            for job_id in range(num_jobs):
+                jsonl_path = Path(f"{output_dir}/contrastive_{dataset_short_name}_{threshold}_{model_short_name}_{prompt_tokens}_{generation_tokens}_{metric}_{contrastive_mode}_job{job_id}.jsonl")
+                if jsonl_path.exists():
+                    with open(jsonl_path, 'r') as infile:
+                        # Count lines for reporting
+                        lines = infile.readlines()
+                        merged_count += len(lines)
+                        # Write all lines to the merged file
+                        for line in lines:
+                            outfile.write(line)
+                else:
+                    print(f"Warning: Missing JSONL file for job {job_id}: {jsonl_path}")
+            
+            print(f"Saved merged JSONL results to {merged_jsonl_path} ({merged_count} total samples)")
+    
+    return merged_results
 
 if __name__ == "__main__":    
     parser = argparse.ArgumentParser(description="Generate contrastive dataset")
     parser.add_argument("--dataset", type=str, default="timaeus/pile-wikipedia_en", help="Dataset to use")
     parser.add_argument("--batch_size", type=int, default=32, help="Batch size for processing")
-    parser.add_argument("--threshold", type=float, default=0.75, help="Memorization score threshold")
+    parser.add_argument("--threshold", type=float, default=1.00, help="Memorization score threshold")
+    parser.add_argument("--dataset_path", type=str, default="data/results/mem_scores_wikipedia-full_gpt-neo-125m_50_50_filtered100.parquet", help="Override path to dataset")
     parser.add_argument("--metric", type=str, default="bleu", choices=["memorization", "bleu"], help="Benchmark metric to use: 'memorization' for exact memorization or 'bleu' for approximate memorization")
     parser.add_argument("--model_name", type=str, default="EleutherAI/gpt-neo-125m", help="Model to use")
     parser.add_argument("--prompt_tokens", type=int, default=50, help="Number of tokens to use as prompt")
@@ -349,6 +411,9 @@ if __name__ == "__main__":
     parser.add_argument("--contrastive_mode", type=str, default="dataset", choices=["divergence", "dataset"], 
                         help="Whether to create contrastive pairs based on the token divergence position or take pairs of memorized vs non-memorized examples")
     parser.add_argument("--output_dir", type=str, default="data/results", help="Directory to save results")
+    parser.add_argument("--job_id", type=int, default=None, help="Current job ID (for Slurm array jobs)")
+    parser.add_argument("--num_jobs", type=int, default=None, help="Total number of jobs (for Slurm array jobs)")
+    parser.add_argument("--merge_only", action="store_true", help="Only merge results from previous jobs without computing")
     
     args = parser.parse_args()
     
@@ -358,52 +423,96 @@ if __name__ == "__main__":
     model_name = args.model_name
     short_model_name = model_name.split('/')[-1]
     dataset = args.dataset
+    dataset_path = args.dataset_path
     short_dataset = dataset.split('/')[-1]
     output_dir = args.output_dir
     
     prompt_tokens = args.prompt_tokens
     generation_tokens = args.generation_tokens    
     contrastive_mode = args.contrastive_mode
+    
+    job_id = args.job_id
+    num_jobs = args.num_jobs
+    merge_only = args.merge_only
+    
+    # For Slurm array jobs, we can also get job_id from environment variable
+    if job_id is None and "SLURM_ARRAY_TASK_ID" in os.environ:
+        job_id = int(os.environ["SLURM_ARRAY_TASK_ID"])
+        print(f"Using SLURM_ARRAY_TASK_ID={job_id}")
+    
+    if num_jobs is None and "SLURM_ARRAY_TASK_COUNT" in os.environ:
+        num_jobs = int(os.environ["SLURM_ARRAY_TASK_COUNT"])
+        print(f"Using SLURM_ARRAY_TASK_COUNT={num_jobs}")
+    
+    # If only merging results
+    if merge_only:
+        if num_jobs is None:
+            print("Error: --num_jobs must be specified when using --merge_only")
+            exit(1)
+        
+        merge_results(output_dir, dataset, model_name, prompt_tokens, generation_tokens, num_jobs, threshold, metric, contrastive_mode)
+        exit(0)
 
     # Create output directory if it doesn't exist
     Path(output_dir).mkdir(parents=True, exist_ok=True)
 
+    # Determine output path based on whether running as part of a job array
+    if job_id is not None and num_jobs is not None:
+        output_path = Path(f"{output_dir}/contrastive_{short_dataset}_{threshold}_{short_model_name}_{prompt_tokens}_{generation_tokens}_{metric}_{contrastive_mode}_job{job_id}.json")
+    else:
+        job_id = 0
+        num_jobs = 1
+        output_path = Path(f"{output_dir}/contrastive_{short_dataset}_{threshold}_{short_model_name}_{prompt_tokens}_{generation_tokens}_{metric}_{contrastive_mode}.json")
+
     # Get the memorization scores file
-    mem_scores_file = Path(f"{output_dir}/mem_scores_{short_dataset}_{short_model_name}_{prompt_tokens}_{generation_tokens}.json")
+    if dataset_path is None:
+        mem_scores_file = Path(f"{output_dir}/mem_scores_{short_dataset}_{short_model_name}_{prompt_tokens}_{generation_tokens}.json")
+    else:
+        mem_scores_file = Path(dataset_path)
     
     # Check if the file exists in the dataset folder
     if not mem_scores_file.exists():
-        # Try looking in the parent results directory
-        mem_scores_file = Path(f"data/results/mem_scores_{short_dataset}_{short_model_name}_{prompt_tokens}_{generation_tokens}.json")
-        if not mem_scores_file.exists():
-            raise FileNotFoundError(f"Could not find memorization scores file at {mem_scores_file}")
+        raise FileNotFoundError(f"Could not find memorization scores file at {mem_scores_file}")    
 
-    df = pd.read_json(mem_scores_file)
+    if output_path.exists():
+        with open(output_path, 'r') as f:
+            all_sequences = json.load(f)["prompts"]
+        print(f"Loaded {len(all_sequences)} contrastive pairs from {output_path}")
+        exit(0)
 
-    len_before = len(df)    
+    if mem_scores_file.suffix == ".parquet":
+        df = pd.read_parquet(mem_scores_file)
+    elif mem_scores_file.suffix == ".json":
+        # For JSON files, read everything then shard in memory
+        # WARNING: wil take a lot of time for large json
+        df = pd.read_json(mem_scores_file)        
+    else:
+        raise ValueError(f"Unsupported file type: {mem_scores_file.suffix}")
+
+    # Shard the dataframe
+    total_rows = len(df)
+    rows_per_job = total_rows // num_jobs
+    start_row = job_id * rows_per_job
+    end_row = start_row + rows_per_job if job_id < num_jobs - 1 else total_rows    
+    print(f"Job {job_id}/{num_jobs}: Processing rows {start_row} to {end_row} out of {total_rows}")
+    df = df.iloc[start_row:end_row]
+
+    len_before = len(df)
     df = df.drop_duplicates(subset=['decoded_context','decoded_completion','decoded_true_completion'])
     len_after = len(df)
-    print(f"Removed {len_before - len_after} duplicate examples")
-
-    # Output path for contrastive dataset
-    path = Path(f"{output_dir}/contrastive_{short_dataset}_{threshold}_{short_model_name}_{prompt_tokens}_{generation_tokens}_{metric}_{contrastive_mode}.json")
-
-    if path.exists():
-        with open(path, 'r') as f:
-            all_sequences = json.load(f)["prompts"]
-        print(f"Loaded {len(all_sequences)} contrastive pairs from {path}")
-        exit()
+    if len_before != len_after:
+        print(f"Removed {len_before - len_after} duplicate examples")
 
     tokenizer = AutoTokenizer.from_pretrained(model_name)
     if contrastive_mode == "divergence":
-        df = df[df['memorization_score'] > threshold]
+        df = df[df['memorization_score'] >= threshold]
         df = df.sort_values('memorization_score', ascending=False)
 
         model = AutoModelForCausalLM.from_pretrained(model_name).to(device)
 
         if device.type == "cuda":
             model = model.half()
-        # Instead of processing everything at once, let's chunk it
+        
         batches = [df.iloc[i:i+batch_size] for i in range(0, len(df), batch_size)]
         all_sequences = defaultdict(list)
         for batch in tqdm(batches,desc="Processing batches"):
@@ -411,8 +520,9 @@ if __name__ == "__main__":
             for key in sequences:
                 all_sequences[key].extend(sequences[key])
         
-        save_autocircuit_ds(all_sequences,path,tokenizer)
-        save_jsonl(all_sequences,path.with_name(f"{path.stem}.jsonl"),tokenizer)
+        # Save results for this job
+        autocircuit_data = save_autocircuit_ds(all_sequences, output_path, tokenizer)
+        save_jsonl(all_sequences, output_path.with_name(f"{output_path.stem}.jsonl"), tokenizer)
 
     elif contrastive_mode=="dataset":
         contrastive_pairs = create_contrastive_pairs(
@@ -421,8 +531,8 @@ if __name__ == "__main__":
                 tokenizer=tokenizer,
                 batch_size=batch_size
             )
-        # Save the dataset
-        with open(path, 'w') as f:
+        # Save the dataset for this job
+        with open(output_path, 'w') as f:
             json.dump(contrastive_pairs, f, indent=2)
         
-        print(f"Saved AutoCircuit dataset with {len(contrastive_pairs['prompts'])} prompt pairs to {path}")
+        print(f"Saved AutoCircuit dataset with {len(contrastive_pairs['prompts'])} prompt pairs to {output_path}")
