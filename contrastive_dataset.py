@@ -33,16 +33,27 @@ def convert_to_sequences(context_tensor:t.Tensor,
     next_gt_tokens = []
     next_generated_tokens = []
     
-    for i in range(len(batch)):
+    batch_size = context_tensor.size(0)
+    
+    for i in range(batch_size):
         min_len = int(min_context_len[i].item())
         
         # Get the context up to min_len
         min_context = context_tensor[i, :min_len]
         minimal_context.append(min_context)
 
-        # take the next 2 tokens: first one will serve as clean/corrupted prompt, second one will be the correct/wrong answer
+        # Take the next 2 tokens: first one will serve as clean/corrupted prompt, second one will be the correct/wrong answer
         next_gt_tokens.append(whole_samples[i, min_len:].tolist())
-        next_generated_tokens.append(generated_outputs[min_len][i, min_len:].tolist()) 
+        
+        # Get generated tokens for this sample at this minimum context length
+        if min_len in generated_outputs and i < generated_outputs[min_len].size(0):
+            next_generated_tokens.append(generated_outputs[min_len][i, min_len:].tolist())
+        else:
+            # Fallback if we don't have generated output for this specific length
+            # Find the closest available context length
+            available_lens = sorted(generated_outputs.keys())
+            closest_len = min(available_lens, key=lambda x: abs(x - min_len))
+            next_generated_tokens.append(generated_outputs[closest_len][i, min_len:].tolist())
     
     return {
         'minimal_context': minimal_context,
@@ -72,8 +83,58 @@ def find_minimum_context_for_memorization(model: AutoModelForCausalLM,
     scores_before = t.ones(len(batch))
     scores_after = t.ones(len(batch))
     
-    for current_len in tqdm(range(context_len, 0, -1),desc="Finding minimum context length for memorization",total=context_len):
-        current_context = context_tensor[:, :current_len]
+    # 1. First run model on full ground truth sequence and save logits for each token position
+    with t.no_grad():
+        outputs = model(context_tensor, return_dict=True)
+        logits = outputs.logits
+    
+    # 2. Find argmax for each position and identify where they differ from ground truth
+    # Shift logits and tokens for next-token prediction comparison
+    shifted_logits = logits[:, :-1, :]
+    shifted_tokens = context_tensor[:, 1:]
+    
+    # Get predictions (excluding the last token which has no corresponding target)
+    predictions = t.argmax(shifted_logits, dim=-1)
+    
+    # Find positions where predictions differ from ground truth
+    diff_positions = (predictions != shifted_tokens)
+
+    diff_positions = diff_positions.nonzero(as_tuple=True)
+    
+    # Extract batch indices and position indices
+    batch_indices, position_indices = diff_positions
+    
+    # Add 1 to position indices to align with original positions (due to shifted tokens)
+    position_indices = position_indices + 1
+    
+    # Create a dictionary to group samples by position
+    position_to_samples = defaultdict(list)
+    for batch_idx, pos_idx in zip(batch_indices.tolist(), position_indices.tolist()):                
+        position_to_samples[pos_idx].append(batch_idx)
+    
+    # Ensure all positions have at least the full context to check
+    if 0 not in position_to_samples:
+        position_to_samples[0] = list(range(len(batch)))
+    
+    # Sort positions from largest to smallest
+    all_positions = sorted(position_to_samples.keys(), reverse=True)
+    
+    # 3. Iterate only over grouped positions that differ, instead of every possible position
+    for current_len in tqdm(all_positions, desc="Finding minimum context length for memorization", total=len(all_positions)):
+        # Get the batch indices for samples that have differences at this position
+        batch_indices_to_check = position_to_samples[current_len]
+        
+        # Only process samples that don't have a min_context_len already
+        batch_indices_to_process = [idx for idx in batch_indices_to_check if t.isnan(min_context_len[idx])]
+        
+        if not batch_indices_to_process:
+            continue
+            
+        # Create a tensor of batch indices
+        batch_indices_tensor = t.tensor(batch_indices_to_process, device=device)
+        
+        # Select only the relevant samples for this position
+        current_context = context_tensor[batch_indices_tensor, :current_len]
         attn_mask = t.ones_like(current_context)
 
         with t.no_grad():
@@ -85,30 +146,26 @@ def find_minimum_context_for_memorization(model: AutoModelForCausalLM,
                 use_cache=True
             )
             
-        # Store the generation output for this context length
-        generated_outputs[current_len] = generation_output
+        # Store the generation output for this context length and these samples
+        if current_len not in generated_outputs:
+            generated_outputs[current_len] = {}
+        for i, idx in enumerate(batch_indices_to_process):
+            generated_outputs[current_len][idx] = generation_output[i]
 
         # Extract the generated completion (excluding the context)
         generated_completion = generation_output[:, current_len:]
-
-        # decoded_context = tokenizer.batch_decode(current_context)
-        # decoded_completion = tokenizer.batch_decode(generated_completion)
-        # decoded_gt = tokenizer.batch_decode(whole_samples[:, current_len:])
+        target_completion = whole_samples[batch_indices_tensor, current_len:]
 
         # Calculate memorization score    
-        correct_tokens = (generated_completion == whole_samples[:, current_len:]).sum(-1)
+        correct_tokens = (generated_completion == target_completion).sum(-1)
         memorization_score = correct_tokens / generated_completion.size(-1)
 
-        # Calculate BLEU-4 score for each sample in the batch        
+        # Calculate BLEU-4 score for the processed batch samples
         bleu_scores = []
-        for batch_i in range(generated_completion.size(0)):
-            # calculate bleu score only if we haven't found the minimum context length yet
-            if t.isnan(min_context_len[batch_i]):
-                bleu_result = compute_bleu([[whole_samples[batch_i, current_len:].tolist()]],[generated_completion[batch_i].tolist()],max_order=4, smooth=True)
-                (bleu, precisions, bp, ratio, translation_length, reference_length) = bleu_result
-                bleu_scores.append(bleu)
-            else:
-                bleu_scores.append(previous_scores[batch_i])
+        for i, batch_idx in enumerate(batch_indices_to_process):
+            bleu_result = compute_bleu([[target_completion[i].tolist()]], [generated_completion[i].tolist()], max_order=4, smooth=True)
+            (bleu, precisions, bp, ratio, translation_length, reference_length) = bleu_result
+            bleu_scores.append(bleu)
         bleu_scores = t.tensor(bleu_scores)
 
         if benchmark_metric == 'bleu':
@@ -118,26 +175,34 @@ def find_minimum_context_for_memorization(model: AutoModelForCausalLM,
         else:
             raise ValueError(f"Invalid benchmark metric: {benchmark_metric}")
         
-        relative_drop = (previous_scores - benchmark_score) / previous_scores
+        # Get previous scores for these specific samples
+        prev_scores_batch = previous_scores[batch_indices_tensor].cpu()
+        relative_drop = (prev_scores_batch - benchmark_score) / prev_scores_batch
         
-        next_token_diff_mask = (generated_completion[:,0] != whole_samples[:, current_len]).cpu()
+        next_token_diff_mask = (generated_completion[:,0] != target_completion[:,0]).cpu()
 
         # Only update min_context_len if:
         # 1. Relative drop is significant
-        # 2. We haven't found a min_context_len yet
-        # 3. The generated token is different from ground truth token
-        mask = (relative_drop > significant_drop_threshold) & t.isnan(min_context_len) & next_token_diff_mask
+        # 2. The generated token is different from ground truth token
+        mask = (relative_drop > significant_drop_threshold) & next_token_diff_mask
         
-        # Store scores before and after the drop
-        scores_before[mask] = previous_scores[mask]
-        scores_after[mask] = benchmark_score[mask]
-
-        min_context_len[mask] = current_len
-
-        # Update previous score        
-        previous_scores = benchmark_score
-
-        scores[current_len] = (bleu_scores.cpu(), memorization_score.cpu())
+        # Get indices of samples that meet the criteria
+        indices_to_update = [batch_indices_to_process[i] for i in range(len(mask)) if mask[i]]
+        
+        # Store scores before and after the drop for the samples being updated
+        for i, idx in enumerate(indices_to_update):
+            scores_before[idx] = prev_scores_batch[i]
+            scores_after[idx] = benchmark_score[i]
+            min_context_len[idx] = current_len
+            
+        # Update previous score only for the processed samples
+        for i, idx in enumerate(batch_indices_to_process):
+            previous_scores[idx] = benchmark_score[i]
+            
+        if current_len in scores:
+            scores[current_len] = (scores[current_len][0], scores[current_len][1])
+        else:
+            scores[current_len] = (bleu_scores.cpu(), memorization_score.cpu())
 
         if (~min_context_len.isnan()).all():
             break    
@@ -145,7 +210,15 @@ def find_minimum_context_for_memorization(model: AutoModelForCausalLM,
     # Ensure all samples have a valid min_context_len by using the full context if necessary
     min_context_len[t.isnan(min_context_len)] = context_len
     
-    sequences = convert_to_sequences(context_tensor,generated_outputs,min_context_len,whole_samples)
+    # Reorganize generated_outputs for convert_to_sequences
+    reorganized_outputs = {}
+    for current_len in generated_outputs:
+        batch_size = len(batch)
+        reorganized_outputs[current_len] = t.zeros((batch_size, whole_samples.size(-1)), dtype=t.long, device=device)
+        for idx, output in generated_outputs[current_len].items():
+            reorganized_outputs[current_len][idx] = output
+    
+    sequences = convert_to_sequences(context_tensor, reorganized_outputs, min_context_len, whole_samples)
 
     # Add scores to sequences
     sequences['score_before'] = scores_before.tolist()
