@@ -20,7 +20,7 @@ import numpy as np
 from tqdm import tqdm
 from functools import partial
 
-pandarallel.initialize(nb_workers=16,progress_bar=False)
+pandarallel.initialize(nb_workers=8,progress_bar=False)
 
 device = t.device("cuda" if t.cuda.is_available() else "mps")
 
@@ -260,7 +260,7 @@ def cut_up_to_pos(row:pd.Series, tokenizer:AutoTokenizer,div_pos:int|None=None):
     if div_pos is None:
         return row['decoded_context']
     
-    return tokenizer.decode(row["context"][:div_pos])
+    return row["context"][:div_pos], tokenizer.decode(row["context"][:div_pos])
 
 # Function to get model embeddings through mean pooling of last layer
 def get_model_embeddings(texts:list[str], tokenizer:AutoTokenizer, model:AutoModelForCausalLM, device=device, batch_size=32):
@@ -284,7 +284,8 @@ def create_contrastive_pairs(df: pd.DataFrame,
                              model: AutoModelForCausalLM,
                              high_threshold: float = 0.75, 
                              low_threshold: float = 0.0, 
-                             max_pairs: int = 1000, batch_size=32) -> list:
+                             batch_size=32,
+                             sim_metric:Literal['embedding','token_overlap']='token_overlap') -> list:
     """
     Create contrastive pairs of examples with high and low memorization scores
     that are semantically similar to each other.
@@ -295,8 +296,9 @@ def create_contrastive_pairs(df: pd.DataFrame,
         model: The language model to use for embeddings and predictions
         high_threshold: Minimum memorization score for "clean" examples
         low_threshold: Maximum memorization score for "corrupt" examples
-        max_pairs: Maximum number of pairs to create
         batch_size: Batch size for embedding generation
+        sim_metric: Similarity metric to use - 'embedding' uses model embeddings,
+                   'token_overlap' calculates token-level similarity
         
     Returns:
         List of dictionaries with contrastive pairs
@@ -323,10 +325,28 @@ def create_contrastive_pairs(df: pd.DataFrame,
         if len_before != len_after:
             print(f"Removed {len_before - len_after} examples with no diverging position")
     
+    # Function to calculate token overlap similarity between two texts
+    def calculate_token_overlap(tokens1, tokens2):                
+        # Convert token lists to sets
+        set1 = set(tokens1)
+        set2 = set(tokens2)
+        
+        # Calculate intersection and union
+        intersection = set1.intersection(set2)
+        union = set1.union(set2)
+        
+        # Calculate Jaccard similarity (intersection over union)
+        overlap_ratio = len(intersection) / len(union) if len(union) > 0 else 0
+        return overlap_ratio
+    
     # Process high memorization examples - cut contexts to diverging_position if available
     print("Generating embeddings for high memorization examples...")
-    high_mem_df['processed_context'] = high_mem_df.apply(partial(cut_up_to_pos, tokenizer=tokenizer), axis=1)
-    high_embeddings = get_model_embeddings(high_mem_df['processed_context'].tolist(), tokenizer=tokenizer, model=model, batch_size=batch_size)
+    high_mem_df['processed_context'], high_mem_df['processed_context_decoded'] = zip(*high_mem_df.apply(partial(cut_up_to_pos, tokenizer=tokenizer), axis=1))
+    
+    # Only generate embeddings if using embedding similarity
+    high_embeddings = None
+    if sim_metric == 'embedding':
+        high_embeddings = get_model_embeddings(high_mem_df['processed_context_decoded'].tolist(), tokenizer=tokenizer, model=model, batch_size=batch_size)
     
     # Find most similar pairs
     print("Finding most similar pairs...")
@@ -342,7 +362,7 @@ def create_contrastive_pairs(df: pd.DataFrame,
             high_context_tokens = high_row["context"]
             
             if div_pos < len(high_context_tokens) - 1:
-                target_token = high_context_tokens[div_pos]                                            
+                target_token = high_context_tokens[div_pos]
                 
                 matching_mask = low_mem_df.parallel_apply(partial(check_matching_token, div_pos=div_pos, target_token=target_token), axis=1)
                 matching_low_df = low_mem_df[matching_mask].copy()
@@ -352,12 +372,19 @@ def create_contrastive_pairs(df: pd.DataFrame,
                     print(f"No matching low examples found for high example {i}")
                     continue
                 
-                matching_low_df['processed_context'] = matching_low_df.parallel_apply(partial(cut_up_to_pos, tokenizer=tokenizer, div_pos=div_pos), axis=1)
+                matching_low_df['processed_context'], matching_low_df['processed_context_decoded'] = zip(*matching_low_df.parallel_apply(partial(cut_up_to_pos, tokenizer=tokenizer, div_pos=div_pos), axis=1))
                 
-                matching_low_embeddings = get_model_embeddings(matching_low_df['processed_context'].tolist(), tokenizer=tokenizer, model=model, batch_size=batch_size)
-                
-                # Calculate similarities only for matching examples
-                similarities = t.nn.functional.cosine_similarity(high_embeddings[i].unsqueeze(0), matching_low_embeddings).cpu()
+                # Calculate similarities based on selected metric
+                if sim_metric == 'embedding':
+                    matching_low_embeddings = get_model_embeddings(matching_low_df['processed_context_decoded'].tolist(), tokenizer=tokenizer, model=model, batch_size=batch_size)
+                    similarities = t.nn.functional.cosine_similarity(high_embeddings[i].unsqueeze(0), matching_low_embeddings).cpu()
+                elif sim_metric == 'token_overlap':
+                    high_context = high_row['processed_context']                    
+                    similarities = matching_low_df.parallel_apply(
+                        lambda low_row: calculate_token_overlap(high_context, low_row['processed_context']),
+                        axis=1
+                    ).tolist()
+                    similarities = t.tensor(similarities)
                 
                 # Sort similarities in descending order to try alternatives if needed
                 similarity_indices = t.argsort(similarities, descending=True)
@@ -370,9 +397,9 @@ def create_contrastive_pairs(df: pd.DataFrame,
                     similarity_score = similarities[idx].item()
                     
                     # Double check that the model's prediction is the target token
-                    with t.no_grad():
-                        inputs = tokenizer(best_match_row['processed_context'], return_tensors="pt").to(device)
-                        outputs = model(**inputs)
+                    with t.no_grad():                        
+                        inputs = t.tensor(best_match_row['processed_context']).unsqueeze(0).to(device)
+                        outputs = model(inputs)
                         logits = outputs.logits[0, -1, :]
                         predicted_token_id = t.argmax(logits).item()
                     
@@ -380,8 +407,8 @@ def create_contrastive_pairs(df: pd.DataFrame,
                         found_valid_match = True
                         
                         # Truncate both contexts to same length (up to diverging position)
-                        high_context_truncated = high_row['processed_context']
-                        low_context_truncated = best_match_row['processed_context']
+                        high_context_truncated = high_row['processed_context_decoded']
+                        low_context_truncated = best_match_row['processed_context_decoded']
                         
                         # Create contrastive pair
                         pair = {
@@ -404,11 +431,19 @@ def create_contrastive_pairs(df: pd.DataFrame,
                 continue
         else:
             # Fall back to original behavior if no diverging_position
-            low_contexts = low_mem_df['decoded_context'].tolist()
-            low_embeddings = get_model_embeddings(low_contexts, tokenizer=tokenizer, model=model, batch_size=batch_size)
-            
-            # Calculate cosine similarity between current high embedding and all low embeddings
-            similarities = t.nn.functional.cosine_similarity(high_embeddings[i].unsqueeze(0), low_embeddings).cpu()
+            if sim_metric == 'embedding':
+                low_contexts = low_mem_df['decoded_context'].tolist()
+                low_embeddings = get_model_embeddings(low_contexts, tokenizer=tokenizer, model=model, batch_size=batch_size)
+                
+                # Calculate cosine similarity between current high embedding and all low embeddings
+                similarities = t.nn.functional.cosine_similarity(high_embeddings[i].unsqueeze(0), low_embeddings).cpu()
+            elif sim_metric == 'token_overlap':
+                high_context = high_row['processed_context']
+                similarities = []
+                for _, low_row in low_mem_df.iterrows():
+                    overlap = calculate_token_overlap(high_context, low_row['decoded_context'])
+                    similarities.append(overlap)
+                similarities = t.tensor(similarities)
             
             # Get the index of the most similar low example
             most_similar_idx = t.argmax(similarities).item()
@@ -642,8 +677,7 @@ if __name__ == "__main__":
                 tokenizer=tokenizer,
                 model=model,
                 high_threshold=threshold,
-                low_threshold=0.0,
-                max_pairs=100000,
+                low_threshold=0.0,                
                 batch_size=batch_size
             )
         # Save the dataset for this job
