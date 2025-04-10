@@ -20,7 +20,7 @@ import numpy as np
 from tqdm import tqdm
 from functools import partial
 
-pandarallel.initialize(nb_workers=8,progress_bar=True)
+pandarallel.initialize(nb_workers=16,progress_bar=False)
 
 device = t.device("cuda" if t.cuda.is_available() else "mps")
 
@@ -263,7 +263,7 @@ def cut_up_to_pos(row:pd.Series, tokenizer:AutoTokenizer,div_pos:int|None=None):
     return tokenizer.decode(row["context"][:div_pos])
 
 # Function to get model embeddings through mean pooling of last layer
-def get_model_embeddings(texts:list[str], tokenizer:AutoTokenizer, model:AutoModelForCausalLM, device=device):
+def get_model_embeddings(texts:list[str], tokenizer:AutoTokenizer, model:AutoModelForCausalLM, device=device, batch_size=32):
     embeddings = []
     with t.no_grad():
         for i in tqdm(range(0, len(texts), batch_size),total=len(texts)//batch_size, desc="Generating embeddings"):
@@ -314,19 +314,26 @@ def create_contrastive_pairs(df: pd.DataFrame,
         return []
     
     # Check if diverging_position column exists
-    has_diverging_position = 'diverging_position' in df.columns        
+    has_diverging_position = 'diverging_position' in df.columns     
+
+    if has_diverging_position:
+        len_before = len(high_mem_df)
+        high_mem_df = high_mem_df.dropna(subset=['diverging_position'])
+        len_after = len(high_mem_df)
+        if len_before != len_after:
+            print(f"Removed {len_before - len_after} examples with no diverging position")
     
     # Process high memorization examples - cut contexts to diverging_position if available
     print("Generating embeddings for high memorization examples...")
     high_mem_df['processed_context'] = high_mem_df.apply(partial(cut_up_to_pos, tokenizer=tokenizer), axis=1)
-    high_embeddings = get_model_embeddings(high_mem_df['processed_context'].tolist(), tokenizer=tokenizer, model=model)
+    high_embeddings = get_model_embeddings(high_mem_df['processed_context'].tolist(), tokenizer=tokenizer, model=model, batch_size=batch_size)
     
     # Find most similar pairs
     print("Finding most similar pairs...")
     contrastive_pairs = []
     
     # Process each high memorization example
-    for i in tqdm(range(min(len(high_mem_df), max_pairs))):
+    for i in tqdm(range(len(high_mem_df)), total=len(high_mem_df), desc="Processing high examples"):
         high_row = high_mem_df.iloc[i]
         
         # Get token at diverging_position + 1 for high memorization example
@@ -347,7 +354,7 @@ def create_contrastive_pairs(df: pd.DataFrame,
                 
                 matching_low_df['processed_context'] = matching_low_df.parallel_apply(partial(cut_up_to_pos, tokenizer=tokenizer, div_pos=div_pos), axis=1)
                 
-                matching_low_embeddings = get_model_embeddings(matching_low_df['processed_context'].tolist(), tokenizer=tokenizer, model=model)
+                matching_low_embeddings = get_model_embeddings(matching_low_df['processed_context'].tolist(), tokenizer=tokenizer, model=model, batch_size=batch_size)
                 
                 # Calculate similarities only for matching examples
                 similarities = t.nn.functional.cosine_similarity(high_embeddings[i].unsqueeze(0), matching_low_embeddings).cpu()
@@ -398,7 +405,7 @@ def create_contrastive_pairs(df: pd.DataFrame,
         else:
             # Fall back to original behavior if no diverging_position
             low_contexts = low_mem_df['decoded_context'].tolist()
-            low_embeddings = get_model_embeddings(low_contexts)
+            low_embeddings = get_model_embeddings(low_contexts, tokenizer=tokenizer, model=model, batch_size=batch_size)
             
             # Calculate cosine similarity between current high embedding and all low embeddings
             similarities = t.nn.functional.cosine_similarity(high_embeddings[i].unsqueeze(0), low_embeddings).cpu()
@@ -586,11 +593,11 @@ if __name__ == "__main__":
     print(f"Job {job_id}/{num_jobs}: Processing rows {start_row} to {end_row} out of {total_rows}")
     df = df.iloc[start_row:end_row]
 
-    # len_before = len(df)
-    # df = df.drop_duplicates(subset=['decoded_context','decoded_completion','decoded_true_completion'])
-    # len_after = len(df)
-    # if len_before != len_after:
-    #     print(f"Removed {len_before - len_after} duplicate examples")
+    len_before = len(df)
+    df = df.drop_duplicates(subset=['decoded_context','decoded_completion','decoded_true_completion'])
+    len_after = len(df)
+    if len_before != len_after:
+        print(f"Removed {len_before - len_after} duplicate examples")
 
     tokenizer = AutoTokenizer.from_pretrained(model_name)
     tokenizer.pad_token_id = tokenizer.eos_token_id
@@ -636,7 +643,7 @@ if __name__ == "__main__":
                 model=model,
                 high_threshold=threshold,
                 low_threshold=0.0,
-                max_pairs=1000,
+                max_pairs=100000,
                 batch_size=batch_size
             )
         # Save the dataset for this job
