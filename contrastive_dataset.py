@@ -176,7 +176,7 @@ def find_minimum_context_for_memorization(model: AutoModelForCausalLM,
             raise ValueError(f"Invalid benchmark metric: {benchmark_metric}")
         
         # Get previous scores for these specific samples
-        prev_scores_batch = previous_scores[batch_indices_tensor].cpu()
+        prev_scores_batch = previous_scores[batch_indices_tensor.cpu()]
         relative_drop = (prev_scores_batch - benchmark_score) / prev_scores_batch
         
         next_token_diff_mask = (generated_completion[:,0] != target_completion[:,0]).cpu()
@@ -418,7 +418,7 @@ if __name__ == "__main__":
     parser.add_argument("--model_name", type=str, default="EleutherAI/gpt-neo-125m", help="Model to use")
     parser.add_argument("--prompt_tokens", type=int, default=50, help="Number of tokens to use as prompt")
     parser.add_argument("--generation_tokens", type=int, default=50, help="Number of tokens to generate")
-    parser.add_argument("--contrastive_mode", type=str, default="dataset", choices=["divergence", "dataset"], 
+    parser.add_argument("--contrastive_mode", type=str, default="divergence", choices=["divergence", "dataset"], 
                         help="Whether to create contrastive pairs based on the token divergence position or take pairs of memorized vs non-memorized examples")
     parser.add_argument("--output_dir", type=str, default="data/results", help="Directory to save results")
     
