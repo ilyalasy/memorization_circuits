@@ -86,7 +86,7 @@ def find_minimum_context_for_memorization(model: AutoModelForCausalLM,
             )
             
         # Store the generation output for this context length
-        generated_outputs[current_len] = generation_output
+        generated_outputs[current_len] = generation_output.cpu()
 
         # Extract the generated completion (excluding the context)
         generated_completion = generation_output[:, current_len:]
@@ -155,9 +155,10 @@ def find_minimum_context_for_memorization(model: AutoModelForCausalLM,
 
 def save_jsonl(all_sequences:dict,path:Path,tokenizer:AutoTokenizer):
     total_skipped_count = 0
+    total_len = len(all_sequences['minimal_context'])
     print(f"Saving decoded data to {path}")        
     with open(path, 'w') as f:
-        for i in range(len(all_sequences['minimal_context'])):
+        for i in range(total_len):
             # Filter those that cannot create clean/corrupt pair
             if all_sequences['next_gt_tokens'][i][0] == all_sequences['next_generated_tokens'][i][0]:
                 total_skipped_count += 1
@@ -174,7 +175,7 @@ def save_jsonl(all_sequences:dict,path:Path,tokenizer:AutoTokenizer):
             
             # Write as JSON line
             f.write(json.dumps(sample) + '\n')
-    print(f"Total skipped count: {total_skipped_count}/{len(mem_df)}")
+    print(f"Total skipped count: {total_skipped_count}/{total_len}")
 
 def save_autocircuit_ds(all_sequences:dict, path:Path, tokenizer:AutoTokenizer):
     """
@@ -395,15 +396,15 @@ if __name__ == "__main__":
 
     tokenizer = AutoTokenizer.from_pretrained(model_name)
     if contrastive_mode == "divergence":
-        mem_df = df[df['memorization_score'] > threshold]
-        mem_df = mem_df.sort_values('memorization_score', ascending=False)
+        df = df[df['memorization_score'] > threshold]
+        df = df.sort_values('memorization_score', ascending=False)
 
         model = AutoModelForCausalLM.from_pretrained(model_name).to(device)
 
         if device.type == "cuda":
             model = model.half()
         # Instead of processing everything at once, let's chunk it
-        batches = [mem_df.iloc[i:i+batch_size] for i in range(0, len(mem_df), batch_size)]
+        batches = [df.iloc[i:i+batch_size] for i in range(0, len(df), batch_size)]
         all_sequences = defaultdict(list)
         for batch in tqdm(batches,desc="Processing batches"):
             sequences = find_minimum_context_for_memorization(model,batch,tokenizer,benchmark_metric=metric)
