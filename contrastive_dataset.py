@@ -613,6 +613,8 @@ if __name__ == "__main__":
     logger = JobLogger.get_logger(job_id)
     
     # For Slurm array jobs, we can also get job_id from environment variable
+    array_task_count = None
+    ntasks = None
     if job_id is None:
         # Handle both array and non-array job modes
         if "SLURM_ARRAY_TASK_ID" in os.environ and "SLURM_ARRAY_TASK_COUNT" in os.environ:
@@ -622,24 +624,26 @@ if __name__ == "__main__":
             array_task_count = int(os.environ["SLURM_ARRAY_TASK_COUNT"])
             ntasks = int(os.environ.get("SLURM_NTASKS", 1))
             procid = int(os.environ.get("SLURM_PROCID", 0))
-            job_id = array_task_id * ntasks + procid
-            num_jobs = array_task_count * ntasks
+            job_id = array_task_id * ntasks + procid            
             logger.info(f"Using SLURM_ARRAY_TASK_ID={array_task_id}, SLURM_NTASKS={ntasks}, SLURM_PROCID={procid}, job_id={job_id}")
         elif "SLURM_PROCID" in os.environ and "SLURM_NTASKS" in os.environ:
             # Single job with tasks mode
             logger.info("Running in single job mode with multiple tasks")
             procid = int(os.environ["SLURM_PROCID"])
             ntasks = int(os.environ["SLURM_NTASKS"])
-            job_id = procid
-            num_jobs = ntasks
+            job_id = procid            
             logger.info(f"Using SLURM_PROCID={procid}, SLURM_NTASKS={ntasks}")
         
         # Update logger with new job ID
         logger = JobLogger.get_logger(job_id)
     
-    if num_jobs is None and "SLURM_ARRAY_TASK_COUNT" in os.environ:
-        num_jobs = int(os.environ["SLURM_ARRAY_TASK_COUNT"])
-        logger.info(f"Using SLURM_ARRAY_TASK_COUNT={num_jobs}")
+    if num_jobs is None:
+        if array_task_count is not None:
+            num_jobs = array_task_count * ntasks
+        elif ntasks is not None:
+            num_jobs = ntasks
+        else:
+            num_jobs = 1        
     
     logger.info(f"Job ID: {job_id}, Number of jobs: {num_jobs}")
 
@@ -747,7 +751,7 @@ if __name__ == "__main__":
                 high_threshold=threshold,
                 low_threshold=0.0,                
                 batch_size=batch_size,
-                sim_metric="token_overlap"
+                sim_metric="embedding"
             )
         # Save the dataset for this job
         with open(output_path, 'w') as f:
