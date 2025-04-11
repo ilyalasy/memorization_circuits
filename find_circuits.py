@@ -39,9 +39,10 @@ def find_minimal_circuit(
     best_edge_count = total_edge_count
     min_edge_count = 1
     max_edge_count = total_edge_count
-    step = max(1, total_edge_count // 100)  # Step size for binary search
+    step = min(50, total_edge_count // 100)  # Step size for binary search
     
     # Binary search to find minimal circuit
+    best_measurements = baseline_measurements
     while min_edge_count <= max_edge_count:
         edge_count = (min_edge_count + max_edge_count) // 2
         
@@ -56,11 +57,12 @@ def find_minimal_circuit(
         
         if current_metric >= target_performance:
             best_edge_count = edge_count
+            best_measurements = measurements
             max_edge_count = edge_count - step  # Try smaller
         else:
             min_edge_count = edge_count + step  # Try larger
     
-    return best_edge_count, measurements, baseline_metric
+    return best_edge_count, best_measurements, baseline_metric
 
 
 if __name__ == "__main__":
