@@ -359,7 +359,7 @@ def create_contrastive_pairs(df: pd.DataFrame,
         return []
     
     # Check if diverging_position column exists
-    has_diverging_position = 'diverging_position' in df.columns     
+    has_diverging_position = 'diverging_position' in df.columns
 
     if has_diverging_position:
         len_before = len(high_mem_df)
@@ -743,6 +743,8 @@ if __name__ == "__main__":
             divergence_df["full_context"] = divergence_df.apply(get_full_context, axis=1)
             divergence_df = divergence_df[["full_context","diverging_position","next_gt_tokens", "next_generated_tokens"]]
             df = df.merge(divergence_df, left_on="decoded_context", right_on="full_context", how="left")
+        else:
+            logger.warning(f"No divergence output found at {divergence_output_path}")
 
         contrastive_pairs = create_contrastive_pairs(
                 df=df,
