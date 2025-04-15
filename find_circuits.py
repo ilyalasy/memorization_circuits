@@ -22,6 +22,8 @@ from auto_circuit.utils.patchable_model import PatchableModel
 
 device = t.device("cuda" if t.cuda.is_available() else "mps")
 
+
+
 def find_minimal_circuit(
         model: PatchableModel, 
         test_loader: PromptDataLoader, 
@@ -88,6 +90,19 @@ def invert_metric(metric: Callable):
         return [[edge_count, -metric_value] for edge_count, metric_value in results]
     return inverted_metric
 
+METRICS = {
+            "answer_logit": measure_answer_val,
+            "neg_answer_logit": invert_metric(measure_answer_val),
+            "wrong_answer_logit": partial(measure_answer_val, wrong_answer=True),
+            "neg_wrong_answer_logit": invert_metric(partial(measure_answer_val, wrong_answer=True)),
+            "answer_nll": partial(measure_answer_val, prob_func="log_softmax"),
+            "correct_ans_percent": measure_correct_ans_percent,
+            "neg_correct_ans_percent": invert_metric(measure_correct_ans_percent),
+            "incorrect_ans_percent": partial(measure_correct_ans_percent, wrong_answer=True),
+            "neg_incorrect_ans_percent": invert_metric(partial(measure_correct_ans_percent, wrong_answer=True)),
+            "logit_diff": measure_answer_diff,
+            "neg_logit_diff": invert_metric(measure_answer_diff)
+        }
 
 def measure_faithfulness(
     model: PatchableModel,  
@@ -137,8 +152,14 @@ if __name__ == "__main__":
     parser.add_argument("--ablation_type", type=str, default="RESAMPLE", choices=["RESAMPLE", "TOKENWISE_MEAN_CLEAN", "TOKENWISE_MEAN_CORRUPT", "TOKENWISE_MEAN_CLEAN_AND_CORRUPT", "BATCH_TOKENWISE_MEAN", "BATCH_ALL_TOK_MEAN", "ZERO"], help="Type of ablation")
     parser.add_argument("--patch_type", type=str, default="EDGE_PATCH", choices=["EDGE_PATCH", "TREE_PATCH"], help="Type of patching")
     parser.add_argument("--grad_function", type=str, default="logit", choices=["logit", "prob", "logprob", "logit_exp"], help="Function to apply to logits before taking the gradient")
-    parser.add_argument("--loss_function", type=str, default="avg_diff", choices=["avg_diff", "neg_avg_diff", "avg_val", "mse", "avg_val_wrong"], help="Loss function")
-    parser.add_argument("--optimize_metric", type=str, default="logit_diff", choices=["neg_logit_diff", "logit_diff", "answer_logit", "wrong_answer_logit", "answer_nll", "correct_ans_percent", "logit_diff", "neg_logit_diff"], help="Metric to optimize during circuit search")
+    parser.add_argument("--loss_function", type=str, default="avg_diff", choices=["avg_diff", "neg_avg_diff", "avg_val_wrong", "avg_val", "mse"], help="Loss function")
+    parser.add_argument("--optimize_metric", type=str, default="logit_diff", choices=[
+                            "neg_logit_diff", "logit_diff", 
+                            "neg_answer_logit", "answer_logit", "wrong_answer_logit", "neg_wrong_answer_logit",
+                            "answer_nll", 
+                            "neg_correct_ans_percent", "correct_ans_percent", 
+                            "neg_incorrect_ans_percent", "incorrect_ans_percent"
+                        ], help="Metric to optimize during circuit search")
     parser.add_argument("--reverse_clean_corrupt", action="store_true", help="Reverse the clean and corrupt inputs")
     parser.add_argument("--target_performance", type=float, default=0.85, help="Target performance as a fraction of baseline")
     parser.add_argument("--wandb_project", type=str, default="circuit-discovery", help="W&B project name")
@@ -257,24 +278,16 @@ if __name__ == "__main__":
                 ablation_type=ablation_type
             )        
                         
-            t.save(prune_scores, prune_scores_path)
-
-        metrics = {
-            "answer_logit": measure_answer_val,
-            "wrong_answer_logit": partial(measure_answer_val, wrong_answer=True),
-            "answer_nll": partial(measure_answer_val, prob_func="log_softmax"),
-            "correct_ans_percent": measure_correct_ans_percent,
-            "logit_diff": measure_answer_diff,
-            "neg_logit_diff": invert_metric(measure_answer_diff)
-        }
+            t.save(prune_scores, prune_scores_path)        
         
         outs = run_circuits(model, test_loader, [0, model.n_edges], prune_scores,ablation_type=ablation_type, patch_type=patch_type, reverse_clean_corrupt=args.reverse_clean_corrupt)
-        baseline_measurements = {label: metric(model, test_loader, outs) for label, metric in metrics.items()}
+        baseline_measurements = {label: metric(model, test_loader, outs) for label, metric in METRICS.items()}
         
         # noising
         if args.reverse_clean_corrupt:
-            _, model_on_clean = baseline_measurements[args.optimize_metric][0] # 0 edges
-            _, model_on_corrupt = baseline_measurements[args.optimize_metric][1] # all edges
+            # Make this vice versa as our baseline is on corrupt for noising (for both datasets)
+            _, model_on_clean = baseline_measurements[args.optimize_metric][1] # all edges
+            _, model_on_corrupt = baseline_measurements[args.optimize_metric][0] # 0 edges
         # denoising
         else:
             _, model_on_corrupt = baseline_measurements[args.optimize_metric][0] # 0 edges
@@ -282,7 +295,7 @@ if __name__ == "__main__":
 
         print(f"Model on clean: {model_on_clean}, Model on corrupt: {model_on_corrupt}")
 
-        metrics["faithfulness"] = partial(measure_faithfulness, metric=metrics[args.optimize_metric], model_on_clean=model_on_clean, model_on_corrupt=model_on_corrupt)
+        METRICS["faithfulness"] = partial(measure_faithfulness, metric=METRICS[args.optimize_metric], model_on_clean=model_on_clean, model_on_corrupt=model_on_corrupt)
         
         # Log to wandb
         wandb.log({        
@@ -295,14 +308,14 @@ if __name__ == "__main__":
         # Find minimal circuit using binary search
         print(f"Finding minimal circuit with target performance: {args.target_performance*100:.0f}% of baseline")    
         min_edge_count, final_metrics = find_minimal_circuit(
-            model, test_loader, prune_scores, metrics, ablation_type=ablation_type, patch_type=patch_type,
+            model, test_loader, prune_scores, METRICS, ablation_type=ablation_type, patch_type=patch_type,
             target_performance_pct=args.target_performance,
             reverse_clean_corrupt=args.reverse_clean_corrupt,            
         )
 
         _, final_metric = final_metrics[args.optimize_metric][0]        
         
-        print(f"Found minimal circuit with {min_edge_count} ({min_edge_count/model.n_edges:.2%}) edges that's optimized for {args.optimize_metric} with {final_metric:.2%}")
+        print(f"Found minimal circuit with {min_edge_count} ({min_edge_count/model.n_edges:.2%}) edges that's optimized for {args.optimize_metric} with {final_metric}")
         
         # Visualize the minimal circuit
         edge_counts = [10,20,50,100,min_edge_count]
@@ -359,6 +372,6 @@ if __name__ == "__main__":
         wandb.summary["min_edge_count"] = min_edge_count
         wandb.summary["min_edge_percentage"] = min_edge_count/model.n_edges
         wandb.summary["final_metric"] = final_metric
-        
+        wandb.summary["faithfulness"] = final_metrics["faithfulness"][0][-1]
         # Finish the wandb run
         wandb.finish()
