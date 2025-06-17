@@ -43,6 +43,7 @@ This approach focuses on the precise moment memorization breaks down:
 This approach contrasts memorized vs. non-memorized content, with enhanced precision when divergence data is available:
 
 **Step 1 - Load Branch Decision (optional)**: Optionaly loads results of `--contrastive_mode divergence` run
+
 **Step 2 - Find contrastive pairs**:
 - **With divergence data**: Finds low-memorization samples that have the same token at the divergence position as the high-memorization sample, then verifies the model would predict that same token, ensuring the contrast is at the exact decision point
 - **Without divergence data**: Uses model embeddings or token overlap to find semantically similar pairs between high and low memorization samples
