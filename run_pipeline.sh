@@ -4,7 +4,6 @@
 set -e
 
 # --- Parse command line arguments ---
-# Default values (same as before)
 MODEL_NAME="EleutherAI/gpt-neo-125m"
 PROMPT_TOKENS=50
 GENERATION_TOKENS=50
@@ -14,9 +13,15 @@ DATASET="timaeus/pile-wikipedia_en"
 OUTPUT_DIR="data/results"
 THRESHOLD=0.75
 METRIC="bleu"
-CONTRASTIVE_MODE="divergence"
+CONTRASTIVE_MODE="dataset" # 
 CONTRASTIVE_BATCH_SIZE=$GLOBAL_BATCH_SIZE
 EAP_BATCH_SIZE=64
+# Find Circuits parameters
+MODE="noising"
+GRAD_FUNCTION="logit"
+LOSS_FUNCTION="avg_val_wrong"
+OPTIMIZE_METRIC="answer_logit"
+WANDB_RUN_NAME="memorization_decision_avg_val_wrong_answer_logit_denoising"
 
 # Parse command line arguments
 while [[ $# -gt 0 ]]; do
@@ -71,6 +76,10 @@ while [[ $# -gt 0 ]]; do
       CONTRASTIVE_BATCH_SIZE="$GLOBAL_BATCH_SIZE"
       shift 2
       ;;
+    --mode)
+      MODE="$2"
+      shift 2
+      ;;
     *)
       echo "Unknown parameter $1"
       exit 1
@@ -104,6 +113,7 @@ echo "CONTRASTIVE_MODE: $CONTRASTIVE_MODE"
 echo "MEM_BATCH_SIZE: $MEM_BATCH_SIZE"
 echo "CONTRASTIVE_BATCH_SIZE: $CONTRASTIVE_BATCH_SIZE"
 echo "EAP_BATCH_SIZE: $EAP_BATCH_SIZE"
+echo "PATCHING MODE: $MODE"
 echo "-------------------------"
 
 # --- Pipeline Steps ---
@@ -130,11 +140,17 @@ python contrastive_dataset.py \
     --output_dir "$DATASET_RESULTS_DIR"
 
 echo "Running circuit finding..."
-python find_circuits_eap.py \
+[ "$MODE" = "noising" ] && REVERSE_FLAG="--reverse_clean_corrupt" || REVERSE_FLAG=""
+python find_circuits.py \
     --model_name "$MODEL_NAME" \
     --path "${DATASET_RESULTS_DIR}/contrastive_${SHORT_DATASET}_${THRESHOLD}_${SHORT_MODEL_NAME}_${PROMPT_TOKENS}_${GENERATION_TOKENS}_${METRIC}_${CONTRASTIVE_MODE}.json" \
     --batch_size "$EAP_BATCH_SIZE" \
-    --output_dir "$CIRCUITS_DIR"
+    --output_dir "$CIRCUITS_DIR" \
+    --grad_function "$GRAD_FUNCTION" \
+    --loss_function "$LOSS_FUNCTION" \
+    --optimize_metric "$OPTIMIZE_METRIC" \
+    --wandb_run_name "$WANDB_RUN_NAME" \
+    $REVERSE_FLAG
 
 echo "Pipeline finished."
 
